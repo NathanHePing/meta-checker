@@ -277,14 +277,6 @@ function snapshot() {
 
 // ---------- HTTP server & UI ----------
 function handleHttp(req, res) {
-  // --- New Run reset-wait endpoint
-if (req.method === 'GET' && req.url === '/reset-wait') {
-  res.writeHead(200);
-  res.end('ok');
-  return;
-}
-
-
   if (req.method === 'POST' && req.url === '/update') {
     let body = ''; req.on('data', c => body += c);
     req.on('end', () => {
@@ -315,6 +307,30 @@ if (req.method === 'GET' && req.url === '/reset-wait') {
     res.end(js);
     return;
   }
+
+    // POST /upload-input?name=some.csv  (body = raw file bytes)
+  if (req.method === 'POST' && req.url.startsWith('/upload-input')) {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const name = (q.get('name') || 'input.csv').replace(/[^\w.\-]+/g, '_');
+    const base = LAUNCH.outDir || 'dist';
+    const dir  = path.join(base, 'telemetry', 'uploads');
+    fs.mkdirSync(dir, { recursive: true });
+    const abs  = path.join(dir, name);
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      try {
+        fs.writeFileSync(abs, Buffer.concat(chunks));
+        LAUNCH.inputPath = abs; // let shard-run sniff this on next read
+        snapshot();             // persist to state.json
+        return sendJson(res, 200, { ok: true, path: abs });
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: String(e && e.message || e) });
+      }
+    });
+    return;
+  }
+
 
 // GET /preflight — report current shape + selection + flags
    if (req.method === 'GET' && req.url === '/preflight') {
@@ -356,27 +372,24 @@ if (req.method === 'POST' && req.url === '/config') {
           // META from Control Panel (all optional; defaults applied in shard-run)
           const metaIn = j.meta || {};
           const meta = {
-          base:        typeof metaIn.base === 'string' ? metaIn.base : '',
-          prefix:      typeof metaIn.prefix === 'string' ? metaIn.prefix : '',
-          outDir:      typeof metaIn.outDir === 'string' ? metaIn.outDir : (LAUNCH.outDir || 'dist'),
-          keepPageParam: !!metaIn.keepPageParam,
-          headless:      !!metaIn.headless,
-          shards:        Number(metaIn.shards || 0) || 0,      // 0 = “use default”
-          bucketParts:   Number(metaIn.bucketParts || 0) || 0, // 0 = “auto”
-          override:      !!metaIn.override,
-          multiShards:   !!metaIn.multiShards
+            base: typeof metaIn.base === 'string' ? metaIn.base : '',
+            prefix: typeof metaIn.prefix === 'string' ? metaIn.prefix : '',
+            outDir: typeof metaIn.outDir === 'string' ? metaIn.outDir : (LAUNCH.outDir || 'dist'),
+            keepPageParam: !!metaIn.keepPageParam,
+            headless: !!metaIn.headless,
+            shards: Number(metaIn.shards || 0) || 0,
+            bucketParts: Number(metaIn.bucketParts || 0) || 0,
+            override: !!metaIn.override,
+            multiShards: !!metaIn.multiShards,
+            inputPath: typeof metaIn.inputPath === 'string' ? metaIn.inputPath : (LAUNCH.inputPath || '')
           };
+
         const errors = [];
         const ok = outputs.length > 0;
         if (!ok) errors.push({ key:'outputs', reason:'Select at least one output.' });
 
         // Always persist started:false here; /start flips to true later
         const cfgObj = { valid: ok, errors, outputs, meta, started: false };
-
-        // If user changed outDir in Control Panel, adopt it for telemetry files too
-        if (meta.outDir && meta.outDir !== (LAUNCH.outDir || '')) {
-          LAUNCH.outDir = meta.outDir;
-       }
         fs.mkdirSync(path.dirname(CONFIG_FILE()), { recursive: true });
         fs.writeFileSync(CONFIG_FILE(), JSON.stringify(cfgObj));
 
@@ -738,6 +751,7 @@ const PAGE_HTML = `<!doctype html>
         outDir: $('cp-outdir').value.trim() || './dist',
         override: $('cp-override').checked,
         fileName: $('cp-file-name').textContent.replace(/^Selected:\\s*/,'') || '',
+        inputPath: saved.inputPath || '',
       };
     }
     window.__mc_state = state; // expose for preflight handler
@@ -772,11 +786,29 @@ const PAGE_HTML = `<!doctype html>
       .forEach(id => $(id).addEventListener('input', recompute));
     shardsSel.addEventListener('change', recompute);
 
-    $('cp-file').addEventListener('change', function(){
+    $('cp-file').addEventListener('change', async function(){
       const f = this.files && this.files[0];
       $('cp-file-name').textContent = f ? ('Selected: ' + f.name) : '';
       recompute();
+      if (!f) return;
+      try {
+        const buf = await f.arrayBuffer();
+        const r = await fetch('/upload-input?name=' + encodeURIComponent(f.name), {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: buf
+        });
+        const j = await r.json();
+        if (j && j.ok && j.path) {
+          // tuck the server path into our persisted CP state
+          const saved = JSON.parse(localStorage.getItem('mc_ctrl') || '{}');
+          saved.inputPath = j.path;
+          saved.fileName  = f.name;
+          localStorage.setItem('mc_ctrl', JSON.stringify(saved));
+        }
+      } catch {}
     });
+
 
     $('cp-copy').addEventListener('click', async function(){
       const text = $('cp-cli').textContent || '';
@@ -997,7 +1029,7 @@ const PAGE_HTML = `<!doctype html>
      const baseInp   = $('cp-base');             // <input>
       const headless  = $('cp-headless')?.checked;
       const multi     = $('cp-multi')?.checked;
-      const keepPage  = $('cp-keepPageParam')?.checked;
+      const keepPage  = $('cp-keeppage')?.checked;
      const shards    = shardsSel ? Number(shardsSel.value) : 0;
       // buckets rule: if multi-shards and shards>1 → 2*shards, else 1
       const bucketParts = (multi && shards > 1) ? (2 * shards) : 1;
@@ -1017,22 +1049,10 @@ const PAGE_HTML = `<!doctype html>
     btn.onclick = async () => {
       const outs = Array.from(form.querySelectorAll('input[name="outputs"]:checked'))
         .map(el => el.value);
-
       errs.textContent = '';
 
-      // pull values from your Control Panel state (adjust if your IDs differ)
-      const s = (window.__mc_state && window.__mc_state()) || {
-        base: '',
-        prefix: '',
-        outDir: './dist',
-        keepPageParam: true,
-        headless: true,
-        multiShards: false,
-        shards: 0,
-        override: false,
-      };
-
-      // buckets rule: if multi-shards & shards>1 → 2*shards, else 1
+      // Pull state from your CP (make sure __mc_state() returns these keys)
+      const s = (window.__mc_state && window.__mc_state()) || {};
       const meta = {
         base: (s.base || '').trim(),
         prefix: (s.prefix || '').trim(),
@@ -1040,34 +1060,40 @@ const PAGE_HTML = `<!doctype html>
         keepPageParam: !!s.keepPageParam,
         headless: !!s.headless,
         multiShards: !!s.multiShards,
-        shards: Number(s.shards || 0) || 0,           // 0 = “use default”
+        shards: Number(s.shards || 0) || 0,
         bucketParts: (s.multiShards && Number(s.shards) > 1) ? (2 * Number(s.shards)) : 1,
-        override: !!s.override
+        override: !!s.override,
+        // IMPORTANT: server-side path returned by your upload endpoint
+        inputPath: (s.inputPath || '').trim()
       };
 
-      // optional UX niceties
       const prevLabel = btn.textContent;
       btn.disabled = true;
       btn.textContent = 'Applying…';
-
       try {
+        // Apply (save config.json)
         const r = await fetch('/config', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ outputs: outs, meta })   // <-- send meta here
+          body: JSON.stringify({ outputs: outs, meta })
         });
-
         const j = await r.json();
-
         if (!r.ok || !j.valid) {
           errs.innerHTML = (j.errors || []).map(e => '• ' + e.key + ': ' + e.reason).join('<br>');
           return;
         }
 
-        // keep a copy around for other UI bits
+        // Make sure UI has the same meta for link building, CLI preview, etc.
         window.__mc_meta = j.meta || meta;
 
-        // hide the preflight box; orchestrator will now wait for /start
+        // “Apply and start”: immediately POST /start
+        const r2 = await fetch('/start', { method: 'POST' });
+        if (!r2.ok) {
+          errs.textContent = 'Apply succeeded but Start failed — press Start.';
+          return;
+        }
+
+        // Hide panel once we’ve started
         box.style.display = 'none';
       } catch (e) {
         errs.textContent = 'Failed to apply selection: ' + (e && e.message ? e.message : e);
@@ -1077,6 +1103,8 @@ const PAGE_HTML = `<!doctype html>
       }
     };
 
+
+}
 
   initPreflight();
   setInterval(tick, 700);

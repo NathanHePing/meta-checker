@@ -52,46 +52,63 @@ process.env.TELEMETRY_PORT = String(TELEMETRY_PORT);
     try { return JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { return null; }
   }
 
-// Preflight selection waits for the UI to POST /config
-const cfgPath = path.join(outDirAbs, 'telemetry', 'config.json');
-
-  function readConfigOnce() { try { return JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { return null; } }
-  async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  console.log('[orchestrator] waiting for output selection in the web UI…');
-  // Hard-gate: wait for valid config (Apply) AND started:true (Start)
-  while (true) {
-    const c = readConfigOnce();
-  if (c && c.valid && Array.isArray(c.outputs) && c.outputs.length) {
-      // Config applied — now require explicit Start unless bypassed via --autostartStart
-      if (c.started === true || String(argv.autostartStart || '').toLowerCase() === 'true') {
-        process.env.META_ONLY_REPORTS = c.outputs.join(',');
-        console.log('[orchestrator] outputs selected:', c.outputs, 'started:', !!c.started);
-
-        // --- APPLY META OVERRIDES FROM CONTROL PANEL ---
-      const m = c.meta || {};
-      // outDir can change *after* we read config from the original path; switch now
-      if (m.outDir && path.resolve(m.outDir) !== outDirAbs) {
-        try {
-          const newCfgPath = path.join(path.resolve(m.outDir), 'telemetry', 'config.json');
-          const again = JSON.parse(fs.readFileSync(newCfgPath, 'utf8'));
-          if (again && again.valid) c.meta = m = again.meta || m;
-        } catch {}
-     }
-      // Update cfg inputs
-      if (m.base) argv.base = m.base;
-      if (typeof m.keepPageParam === 'boolean') argv.keepPageParam = m.keepPageParam;
-     if (m.prefix) argv.pathPrefix = m.prefix;
-      if (m.outDir) argv.outDir = m.outDir;
-      if (typeof m.headless === 'boolean') argv.headless = m.headless;
-     if (m.shards) argv.shards = Number(m.shards);
-      // bucketParts default rule: if multi-shards and shards>1 -> 2*shards, else 1
-      if (m.bucketParts) argv.bucketParts = Number(m.bucketParts);
+// wait loop in shard-run.js
+async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+console.log('[orchestrator] waiting for output selection in the web UI…');
+while (true) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${TELEMETRY_PORT}/preflight`, { cache: 'no-store' });
+    if (!r.ok) throw 0;
+    const j = await r.json();
+    if (Array.isArray(j.outputs) && j.outputs.length) {
+      if (j.started === true) {
+        process.env.META_ONLY_REPORTS = j.outputs.join(',');
+        const m = j.meta || {};
+        if (m.base) argv.base = m.base;
+        if (m.prefix != null) argv.pathPrefix = m.prefix;
+        if (m.outDir) argv.outDir = m.outDir;
+        if (typeof m.keepPageParam === 'boolean') argv.keepPageParam = m.keepPageParam;
+        if (+m.shards > 0) argv.shards = +m.shards;
+        if (+m.bucketParts > 0) argv.bucketParts = +m.bucketParts;
+        if (m.inputPath) argv.input = m.inputPath;
         break;
+      }
     }
-    }
-    await sleep(300);
-  }
+  } catch {}
+  await sleep(300);
+}
+
+
+
+//Keep!!!
+const cfg = {
+  base: argv.base,
+  pathPrefix: sanitizePathPrefix(argv.pathPrefix || ''),
+  keepPageParam: !!argv.keepPageParam,
+  shards: Math.min(+argv.shardCap || Infinity, Math.max(1, +argv.shards || os.cpus().length)),
+  outDir: path.resolve(String(argv.outDir || 'dist')),
+  childEntry: path.resolve('src/index.js'),
+};
+
+const origin   = new URL(cfg.base).origin;
+const prefix   = String(cfg.pathPrefix || '').replace(/^["']|["']$/g, '').replace(/\/+$/, '');
+const followup = String(argv.followup || 'none').toLowerCase();
+
+// buckets: 2*shards if shards>1, else 1 (unless explicitly provided)
+let bucketParts = Number(argv.bucketParts || 0);
+if (!bucketParts) bucketParts = (cfg.shards > 1 ? (2 * cfg.shards) : 1);
+
+//debug log to confirm everything
+console.log('[orchestrator] final meta:', {
+  base: cfg.base,
+  pathPrefix: cfg.pathPrefix,
+  outDir: cfg.outDir,
+  shards: cfg.shards,
+  bucketParts,
+  keepPageParam: cfg.keepPageParam,
+  input: argv.input || ''
+});
+
 
 // optional: start the terminal TUI that reads dist/telemetry/state.json
 try {
@@ -141,26 +158,6 @@ if (typeof meta.outDir === 'string' && meta.outDir)             argv.outDir = me
 if (typeof meta.keepPageParam === 'boolean')                    argv.keepPageParam = meta.keepPageParam;
 if (typeof meta.shards === 'number' && meta.shards > 0)         argv.shards = meta.shards;
 if (typeof meta.bucketParts === 'number' && meta.bucketParts > 0) argv.bucketParts = meta.bucketParts;
-
-// Build final cfg from possibly-updated argv/meta
-const finalOutDir = path.resolve(String(argv.outDir || outDirAbs || 'dist'));
-const cfg = {
-  base: argv.base,
-  pathPrefix: sanitizePathPrefix(argv.pathPrefix || ''),
-  keepPageParam: !!argv.keepPageParam,
-  shards: Math.min(+argv.shardCap || Infinity, Math.max(1, +argv.shards || os.cpus().length)),
-  outDir: finalOutDir,
-  childEntry: path.resolve('src/index.js'),
-};
-
-// Derived values used below
-const origin   = new URL(cfg.base).origin;
-const prefix   = String(cfg.pathPrefix || '').replace(/^["']|["']$/g, '').replace(/\/+$/, '');
-const followup = String(argv.followup || 'none').toLowerCase();
-
-// If user didn’t specify bucketParts, use rule: 2 * shards (when shards > 1) else 1
-let bucketParts = Number(argv.bucketParts || 0);
-if (!bucketParts) bucketParts = (cfg.shards > 1 ? (2 * cfg.shards) : 1);
 
 // let telemetry know what we're launching (for /preflight CSV sniffing, etc.)
 (tmod.setLaunchContext || (()=>{}))({
@@ -220,7 +217,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
     telemetry.step('spawn-workers');
 
     // fan out across N shards; each child slices via --shards/--shardIndex
-    const parts = Math.min(cfg.shards, +argv.parts || cfg.shards);
+    const parts = cfg.shards;
     let finished = 0;
 
     for (let i = 0; i < parts; i++) {
@@ -228,7 +225,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       const childArgs = [
         cfg.childEntry,
         '--base', cfg.base,
-        '--input', inputPath,
+        '--input', argv.input || 'input.csv', 
         '--concurrency', String(argv.concurrency || 4),
         '--keepPageParam', String(cfg.keepPageParam),
         '--outDir', cfg.outDir,
@@ -518,13 +515,13 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   const sectionUrls = sections.map(s => new URL(`${prefix}/${s}`.replace(/\/+/g,'/'), cfg.base).toString());
   const bootstrapSeeds = Array.from(new Set([seedUrl, ...rootUrls, ...sectionUrls, ...filtered]));
   if (bootstrapSeeds.length) {
-    appendToBuckets(frontierDir, bootstrapSeeds, bucketParts);
+    seedBuckets(frontierDir, [seedUrl0], bucketParts);
     telemetry.step('bootstrap-frontier');
     console.log('[orchestrator] bootstrap frontier +', bootstrapSeeds.length, 'seeds');
   }
 
   // --- tasks: N frontier workers ---
-  const parts = Math.min(cfg.shards, +argv.parts || cfg.shards);
+  const parts = cfg.shards;
   const tasks = Array.from({ length: parts }, (_, i) => ({
     kind: 'frontier',
     workerId: i + 1,
@@ -541,6 +538,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       '--urlsOutFile', path.join(cfg.outDir, `urls-final.part${i+1}.json`),
     ]
   }));
+
 
   // optional: section follow-up
   if (followup === 'sections' && sections.length) {
@@ -578,17 +576,16 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
     running++;
 
     const childArgs = [
-      cfg.childEntry,
-      '--base', cfg.base,
-      '--input', argv.input || 'input.csv',
-      '--concurrency', String(argv.concurrency || 4),
-      '--keepPageParam', String(cfg.keepPageParam),
-      '--headless', String(!!argv.headless),
-      '--outDir', cfg.outDir,
-      '--rebuildLinks', argv.rebuildLinks ? 'true' : 'false',
-      '--dropCache',   argv.dropCache   ? 'true' : 'false',
-      ...t.argv
-    ];
+    cfg.childEntry,
+    '--base', cfg.base,
+    '--input', argv.input || 'input.csv',
+    '--concurrency', String(argv.concurrency || 4),
+    '--keepPageParam', String(cfg.keepPageParam),
+    '--outDir', cfg.outDir,
+    '--rebuildLinks', argv.rebuildLinks ? 'true' : 'false',
+    '--dropCache',   argv.dropCache   ? 'true' : 'false',
+    ...t.argv
+  ];
 
     console.log('[orchestrator] spawn', t.kind, t.section ? t.section : '', childArgs.slice(1).join(' '));
     telemetry.threadStatus({ workerId: t.workerId, phase: `spawn:${t.kind}`, url: t.section || '' });
@@ -605,10 +602,10 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
       // Append this worker's URLs
       try {
-        const outArgIdx = t.argv.findIndex(a => a === '--urlsOutFile');
-        const fileArgIdx = t.argv.findIndex(a => a === '--urlsFile');
-        const file = outArgIdx >= 0 ? t.argv[outArgIdx + 1]
-                  : fileArgIdx >= 0 ? t.argv[fileArgIdx + 1]
+          const outArgIdx = t.argv.findIndex(a => a === '--urlsOutFile');
+          const fileArgIdx = t.argv.findIndex(a => a === '--urlsFile');
+          const file = outArgIdx >= 0 ? t.argv[outArgIdx + 1]
+                    : fileArgIdx >= 0 ? t.argv[fileArgIdx + 1]
                           : null;
         if (file && fs.existsSync(file)) {
           const urls = JSON.parse(fs.readFileSync(file, 'utf8'));
