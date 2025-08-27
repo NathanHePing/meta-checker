@@ -210,6 +210,8 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
       const newPos = pos + advanced;
       try { writeFileWithRetry(offset, String(newPos), 'utf8'); } catch {}
       tEmit('bucketProgress', { bucket: r, cursor: newPos, size: buf.length, claimed: true });
+      const delayMs = parseInt(process.env.MC_POLITE_DELAY_MS || '0', 10) || 0;
+      if (delayMs > 0) { try { sleepMs(delayMs); } catch {} }
       return { url, ...claim };
     }
   }

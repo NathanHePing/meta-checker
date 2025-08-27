@@ -65,7 +65,7 @@ function setLaunchContext(ctx) {
 
 
 const STATE = {
-  startedAt: Date.now(),
+  startedAt: 0,
   mode: 'init',
   stepper: { steps: ['discover', 'fetch', 'compare'], currentIndex: 0 },
   totals: { urlsFound: 0, internalEdges: 0 },
@@ -171,12 +171,13 @@ let server = null;
 let PORT   = 0;
 
 function nowHMS() {
-  const ms = Date.now() - STATE.startedAt;
+  const ms = STATE.startedAt ? (Date.now() - STATE.startedAt) : 0;
   const hh = Math.floor(ms/3600000);
   const mm = Math.floor((ms%3600000)/60000);
   const ss = Math.floor((ms%60000)/1000);
   return `${hh}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
 }
+
 
 // ---------- public API ----------
 function init(opts = {}) {
@@ -402,19 +403,28 @@ if (req.method === 'POST' && req.url === '/config') {
     return;
   }
 
-// POST /start (separate Start button in Control Panel)
-   if (req.method === 'POST' && req.url === '/start') {
+  // POST /start (separate Start button in Control Panel)
+  if (req.method === 'POST' && req.url === '/start') {
     const file = readConfigFile() || { valid:false, outputs:[], meta:{}, started:false };
     // Only allow start if config is valid and has at least one output
     if (file && file.valid && Array.isArray(file.outputs) && file.outputs.length) {
+      // clear any lingering stop.flag
+      try {
+        const stopFile = path.join((LAUNCH.outDir || 'dist'), 'telemetry', 'stop.flag');
+        if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile);
+      } catch {}
       file.started = true;
       fs.mkdirSync(path.dirname(CONFIG_FILE()), { recursive: true });
       fs.writeFileSync(CONFIG_FILE(), JSON.stringify(file));
+
       STARTED = true;
+      // Start the run timer NOW (not at server boot)
+      STATE.startedAt = Date.now();
       return sendJson(res, 200, { ok:true });
     }
     return sendJson(res, 400, { ok:false, reason:'No valid config applied yet' });
   }
+
 
   // --- Files listing since the run started ---
   if (req.method === 'GET' && req.url.startsWith('/files')) {
@@ -466,6 +476,10 @@ if (req.method === 'POST' && req.url === '/config') {
     STATE.tree = {};
     STATE.events = [];
     try { fs.unlinkSync(CONFIG_FILE()); } catch {}
+    try {
+      const stopFile = path.join((LAUNCH.outDir || 'dist'), 'telemetry', 'stop.flag');
+      if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile);
+    } catch {}
     res.writeHead(204); res.end();
     return;
   }
@@ -473,6 +487,38 @@ if (req.method === 'POST' && req.url === '/config') {
     // simple ack endpoint polled by the orchestrator to detect that reset happened
     res.writeHead(200); res.end('ok'); return;
   }
+
+  // --- Stop signal (graceful)
+  if (req.method === 'POST' && req.url === '/stop') {
+    try {
+      const stopFile = path.join((LAUNCH.outDir || 'dist'), 'telemetry', 'stop.flag');
+      fs.mkdirSync(path.dirname(stopFile), { recursive: true });
+      fs.writeFileSync(stopFile, String(Date.now()));
+
+      // Also flip config.started to false so orchestrator won't auto-restart
+      const cfg = readConfigFile() || { valid:false, outputs:[], meta:{}, started:false };
+      cfg.started = false;
+      fs.mkdirSync(path.dirname(CONFIG_FILE()), { recursive: true });
+      fs.writeFileSync(CONFIG_FILE(), JSON.stringify(cfg));
+    } catch {}
+    // Don't reset telemetry here; only a manual "New Run" should reset state
+    res.writeHead(204); res.end(); return;
+  }
+
+
+  if (req.method === 'GET' && req.url === '/stop-state') {
+    try {
+      const stopFile = path.join((LAUNCH.outDir || 'dist'), 'telemetry', 'stop.flag');
+      const exists = fs.existsSync(stopFile);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ stop: !!exists }));
+    } catch {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ stop: false }));
+    }
+    return;
+  }
+
 
 
   if (req.method === 'GET' && req.url === '/favicon.ico') { res.writeHead(204); res.end(); return; }
@@ -561,7 +607,7 @@ const PAGE_HTML = `<!doctype html>
       </div>
 
       <div class="cp-col">
-        <label class="cp-k">Keep ?page= param</label>
+        <label class="cp-k">Keep the ?page= query in links</label>
         <div class="cp-row">
           <input id="cp-keeppage" type="checkbox" checked />
           <span class="cp-help">Don’t strip <span class="mono">?page=</span> from URLs.</span>
@@ -569,7 +615,7 @@ const PAGE_HTML = `<!doctype html>
       </div>
 
       <div class="cp-col">
-        <label class="cp-k">Headless</label>
+        <label class="cp-k">Run browser in the background</label>
         <div class="cp-row">
           <input id="cp-headless" type="checkbox" checked />
           <span class="cp-help">Sets <span class="mono">PLAYWRIGHT_HEADLESS=1</span> in the CLI.</span>
@@ -577,12 +623,29 @@ const PAGE_HTML = `<!doctype html>
       </div>
 
       <div class="cp-col">
-        <label class="cp-k">Multi-shards</label>
+        <label class="cp-k">Multiple parallel workers</label>
         <div class="cp-row">
           <input id="cp-multi" type="checkbox" />
           <span class="cp-help">Enable parallel shards (workers).</span>
         </div>
       </div>
+
+      <div class="cp-col">
+        <label class="cp-k">Safe mode (gentle crawl)</label>
+        <div class="cp-row">
+          <input id="cp-prod" type="checkbox" />
+          <span class="cp-help">Throttles workers & adds polite delays to reduce server load.</span>
+        </div>
+      </div>
+
+      <div class="cp-col">
+        <label class="cp-k">Max shards (auto)</label>
+        <div class="cp-row">
+          <input id="cp-maxshards" type="checkbox" />
+          <span class="cp-help">Sets shards to your CPU cores; buckets auto = <span class="mono">2 × shards</span>.</span>
+        </div>
+      </div>
+
 
       <div class="cp-col" id="cp-shard-col" style="display:none;">
         <label class="cp-k" for="cp-shards">Shards</label>
@@ -596,14 +659,15 @@ const PAGE_HTML = `<!doctype html>
       </div>
 
       <div class="cp-col">
-        <label class="cp-k" for="cp-outdir">Output directory</label>
+        <label class="cp-k" for="cp-outdir">Output folder (local)</label>
         <div class="cp-row">
           <input id="cp-outdir" type="text" value="./dist" />
-          <button class="btn secondary" id="cp-browse">Browse…</button>
+          <button class="btn secondary" id="cp-browse">Choose folder…</button>
           <input id="cp-dirpicker" type="file" style="display:none" webkitdirectory directory />
         </div>
-        <div class="cp-help">Folder where files are written.</div>
+        <div class="cp-help">This is a local <b>write</b> location (nothing uploads). Default is <span class="mono">./dist</span>.</div>
       </div>
+
 
       <div class="cp-col">
         <label class="cp-k">Override existing outputs</label>
@@ -640,9 +704,12 @@ const PAGE_HTML = `<!doctype html>
     </div>
   </div>
 
-  <div class="cp-row" style="margin-top:8px;">
+  <div class="cp-row" style="margin-top:8px; gap:10px;">
+    <button class="btn" id="cp-stop">Stop Run</button>
     <button class="btn secondary" id="cp-newrun">New Run</button>
+    <span class="hint">Stop halts the current run gracefully; New Run resets telemetry.</span>
   </div>
+
   <!-- ==================== END CONTROL PANEL ==================== -->
 
 
@@ -738,22 +805,36 @@ const PAGE_HTML = `<!doctype html>
 
     function state(){
       const multi = $('cp-multi').checked;
-      const shards = multi ? Math.max(1, parseInt(shardsSel.value || '1', 10)) : 1;
-      const buckets = (multi && shards > 1) ? (shards * 2) : 1;
+      // Prod and Multi are mutually exclusive — if Prod is on, force Multi off
+      const prod = $('cp-prod').checked;
+      const effectiveMulti = prod ? false : multi;
+
+      // Max shards checkbox only meaningful when multi is enabled
+      const maxAuto = effectiveMulti ? $('cp-maxshards').checked : false;
+
+      const hw = (navigator.hardwareConcurrency || 1);
+      const shardsSelVal = Math.max(1, parseInt(($('cp-shards').value || '1'), 10));
+      const shards = maxAuto ? hw : (effectiveMulti ? shardsSelVal : 1);
+      const buckets = (effectiveMulti && shards > 1) ? (shards * 2) : 1;
+
       return {
         base: $('cp-base').value.trim(),
         prefix: $('cp-prefix').value.trim(),
         keepPageParam: $('cp-keeppage').checked,
         headless: $('cp-headless').checked,
-        multi,
+        // persist original toggles so the server knows user's intent
+        prod: prod,
+        multi: effectiveMulti,
+        maxShards: maxAuto,
         shards,
         buckets,
         outDir: $('cp-outdir').value.trim() || './dist',
         override: $('cp-override').checked,
-        fileName: $('cp-file-name').textContent.replace(/^Selected:\\s*/,'') || '',
-        inputPath: saved.inputPath || '',
+        fileName: $('cp-file-name').textContent.replace(/^Selected:\s*/,'') || '',
+        inputPath: (JSON.parse(localStorage.getItem('mc_ctrl') || '{}').inputPath || '')
       };
-    }
+}
+
     window.__mc_state = state; // expose for preflight handler
 
     function save(){ localStorage.setItem('mc_ctrl', JSON.stringify(state())); }
@@ -762,6 +843,29 @@ const PAGE_HTML = `<!doctype html>
       const s = state();
       $('cp-shard-col').style.display = s.multi ? '' : 'none';
       $('cp-buckets').textContent = String(s.buckets);
+
+      // Show/Hide “Max shards (auto)” checkbox with multi only
+      $('cp-maxshards').closest('.cp-col').style.display = s.multi ? '' : 'none';
+
+      // If auto, reflect computed shards in the dropdown (cap 32 just for UI)
+      if (s.maxShards) $('cp-shards').value = String(Math.min(32, Math.max(1, s.shards)));
+
+      $('cp-prod').addEventListener('change', () => {
+        if ($('cp-prod').checked) {
+          $('cp-multi').checked = false; // enforce mutual exclusivity
+        }
+        recompute();
+      });
+
+      $('cp-multi').addEventListener('change', () => {
+        if ($('cp-multi').checked) {
+          $('cp-prod').checked = false; // enforce mutual exclusivity
+        } else {
+          $('cp-maxshards').checked = false;
+        }
+        recompute();
+      });
+
 
       const envPrefix = s.headless ? 'set PLAYWRIGHT_HEADLESS=1 && ' : '';
       const parts = ['node','scripts/shard-run.js'];
@@ -828,19 +932,33 @@ const PAGE_HTML = `<!doctype html>
 
     $('cp-browse').addEventListener('click', () => $('cp-dirpicker').click());
     $('cp-dirpicker').addEventListener('change', function(){
+      // When the user picks a folder, the first file has webkitRelativePath like "chosenFolder/…"
       const f = this.files && this.files[0];
       if (f && f.webkitRelativePath) {
         const root = f.webkitRelativePath.split('/')[0] || 'dist';
-        const cur = $('cp-outdir').value.trim() || './dist';
-        if (cur === './dist' || cur === 'dist') $('cp-outdir').value = './' + root;
+        $('cp-outdir').value = './' + root; // auto-fill output field
+        const saved = JSON.parse(localStorage.getItem('mc_ctrl') || '{}');
+        saved.outDir = $('cp-outdir').value;
+        localStorage.setItem('mc_ctrl', JSON.stringify(saved));
       }
       recompute();
     });
+
 
     $('cp-newrun').addEventListener('click', async function(){
       try { await fetch('/reset-wait'); } catch {}
       location.reload();
     });
+
+    $('cp-stop').addEventListener('click', async function(){
+      try {
+        await fetch('/stop', { method: 'POST' });
+        alert('Stop requested — halting workers safely.');
+      } catch (e) {
+        alert('Stop failed: ' + (e && e.message ? e.message : e));
+      }
+    });
+
 
     recompute();
   })();
@@ -1059,13 +1177,15 @@ const PAGE_HTML = `<!doctype html>
         outDir: (s.outDir || '').trim() || './dist',
         keepPageParam: !!s.keepPageParam,
         headless: !!s.headless,
-        multiShards: !!s.multiShards,
+        prod: !!s.prod,
+        maxShards: !!s.maxShards,
+        multiShards: !!s.multi,
         shards: Number(s.shards || 0) || 0,
-        bucketParts: (s.multiShards && Number(s.shards) > 1) ? (2 * Number(s.shards)) : 1,
+        bucketParts: (s.multi && Number(s.shards) > 1) ? (2 * Number(s.shards)) : 1,
         override: !!s.override,
-        // IMPORTANT: server-side path returned by your upload endpoint
         inputPath: (s.inputPath || '').trim()
       };
+
 
       const prevLabel = btn.textContent;
       btn.disabled = true;

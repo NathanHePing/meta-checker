@@ -55,6 +55,17 @@ process.env.TELEMETRY_PORT = String(TELEMETRY_PORT);
 
 // wait loop in shard-run.js
 async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+async function stopRequested() {
+  const port = Number(process.env.TELEMETRY_PORT || 0);
+  if (!port) return false;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/stop-state`, { cache: 'no-store' });
+    if (!r.ok) return false;
+    const j = await r.json();
+    return !!(j && j.stop);
+  } catch { return false; }
+}
+
 console.log('[orchestrator] waiting for output selection in the web UI…');
 while (true) {
   try {
@@ -70,23 +81,24 @@ while (true) {
         if (m.prefix != null) argv.pathPrefix = m.prefix;
         if (m.outDir) argv.outDir = m.outDir;
         if (typeof m.keepPageParam === 'boolean') argv.keepPageParam = m.keepPageParam;
+
+        // NEW: prod + maxShards
+        if (typeof m.prod === 'boolean') argv.prod = m.prod;
+        if (typeof m.maxShards === 'boolean') argv.maxShards = m.maxShards;
+
         if (+m.shards > 0) argv.shards = +m.shards;
         if (+m.bucketParts > 0) argv.bucketParts = +m.bucketParts;
         if (m.inputPath) argv.input = m.inputPath;
 
-        // NEW: honor Control Panel “Headless”
         if (typeof m.headless === 'boolean') {
           process.env.PLAYWRIGHT_HEADLESS = m.headless ? '1' : '';
         }
-
         break;
       }
     }
   } catch {}
   await sleep(300);
 }
-
-
 
 //Keep!!!
 const cfg = {
@@ -95,16 +107,32 @@ const cfg = {
   keepPageParam: !!argv.keepPageParam,
   shards: Math.min(+argv.shardCap || Infinity, Math.max(1, +argv.shards || os.cpus().length)),
   outDir: path.resolve(String(argv.outDir || 'dist')),
-  childEntry: path.resolve('src/index.js'),
+  childEntry: path.resolve('../index.js'),
 };
 
-const origin   = new URL(cfg.base).origin;
-const prefix   = String(cfg.pathPrefix || '').replace(/^["']|["']$/g, '').replace(/\/+$/, '');
-const followup = String(argv.followup || 'none').toLowerCase();
+// --- Apply "maxShards" if requested by UI
+if (argv.maxShards === true || String(argv.maxShards) === 'true') {
+  cfg.shards = Math.max(1, os.cpus().length);
+}
 
 // buckets: 2*shards if shards>1, else 1 (unless explicitly provided)
 let bucketParts = Number(argv.bucketParts || 0);
 if (!bucketParts) bucketParts = (cfg.shards > 1 ? (2 * cfg.shards) : 1);
+
+// --- Prod (safe) mode policy
+if (argv.prod === true || String(argv.prod) === 'true') {
+  // Lower pressure:
+  //  - reduce child concurrency to 1
+  //  - optional: cap shards to half the CPUs (min 1)
+  //  - add a global polite delay for frontier claims (used by frontier.js)
+  cfg.shards = 1;                 // prod = single shard
+  argv.concurrency = 1;           // and single-page concurrency
+  process.env.MC_POLITE_DELAY_MS = process.env.MC_POLITE_DELAY_MS || '400';
+  process.env.MC_USER_AGENT = process.env.MC_USER_AGENT || 'MetaChecker/1.0 (safe mode; contact=you@example.com)';
+  bucketParts = 1;                // one bucket
+  // also force page-level concurrency 1 in children below
+  argv.concurrency = 1;
+}
 
 //debug log to confirm everything
 console.log('[orchestrator] final meta:', {
@@ -114,8 +142,11 @@ console.log('[orchestrator] final meta:', {
   shards: cfg.shards,
   bucketParts,
   keepPageParam: cfg.keepPageParam,
+  prod: !!argv.prod,
+  maxShards: !!argv.maxShards,
   input: argv.input || ''
 });
+
 
 
 // optional: start the terminal TUI that reads dist/telemetry/state.json
@@ -150,11 +181,6 @@ function parseFirstColumn(filePath) {
   }
 }
 
-// helper to read telemetry config
-function readConfigFile() {
-  try { return JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { return null; }
-}
-
 // ---- apply Control Panel meta overrides from telemetry/config.json ----
 const file = readConfigFile() || { meta:{} };
 const meta = file.meta || {};
@@ -186,6 +212,10 @@ telemetry.step(0);
 
 if (!cfg.base) { console.error('✖ Missing required flag: --base'); process.exit(1); }
 fs.mkdirSync(cfg.outDir, { recursive: true });
+
+const origin   = new URL(cfg.base).origin;
+const prefix   = String(cfg.pathPrefix || '').replace(/^["']|["']$/g, '').replace(/\/+$/, '');
+const followup = String(argv.followup || 'none').toLowerCase();
 
 const sniff = parseFirstColumn(inputPath);
 const sitemapMode = sniff.explicit && sniff.urls.length > 0;
@@ -228,7 +258,9 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
     const parts = cfg.shards;
     let finished = 0;
 
+    const children = new Set();
     for (let i = 0; i < parts; i++) {
+      if (await stopRequested()) break;
       const partOut = path.join(cfg.outDir, `urls-final.part${i + 1}.json`);
       const childArgs = [
         cfg.childEntry,
@@ -257,7 +289,9 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         stdio: 'inherit',
         env: { ...process.env, TELEMETRY_PORT: String(TELEMETRY_PORT) }
       });
+      children.add(child);
       child.on('exit', async (code) => {
+        children.delete(child);
         finished++;
         telemetry.threadStatus({ workerId: i + 1, phase: 'exit:root-urls', done: true, code });
         if (code !== 0) console.error(`Error: worker for root-urls shard ${i+1}/${parts} exited ${code}`);
@@ -273,8 +307,15 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
           console.warn('[append warn]', String(e && e.message ? e.message : e));
         }
 
+        if (await stopRequested()) {
+          for (const c of children) { try { c.kill('SIGINT'); } catch {} }
+          console.log('[orchestrator] stop requested — halting sitemap mode');
+          return; // leaves telemetry running; user can New Run
+}
+
         if (finished === parts) await finalizeSitemap();
       });
+      
     }
 
     async function finalizeSitemap() {
@@ -533,6 +574,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
   // --- tasks: N frontier workers ---
   const parts = cfg.shards;
+  const children = new Set();
   const tasks = Array.from({ length: parts }, (_, i) => ({
     kind: 'frontier',
     workerId: i + 1,
@@ -581,7 +623,8 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   const maxParallel = Math.min(cfg.shards, tasks.length);
   let running = 0, idx = 0;
 
-  function launchNext() {
+  async function launchNext() {
+    if (await stopRequested()) return;
     if (idx >= tasks.length) return;
     const t = tasks[idx++];
     running++;
@@ -605,8 +648,10 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       stdio: 'inherit',
       env: { ...process.env, TELEMETRY_PORT: String(TELEMETRY_PORT) }
     });
+    children.add(child);
 
     child.on('exit', async (code) => {
+      children.delete(child);
       running--;
       telemetry.threadStatus({ workerId: t.workerId, phase: `exit:${t.kind}`, done: true, code });
       if (code !== 0) console.error(`Error: worker for ${t.kind}${t.section?`:${t.section}`:''} exited ${code}`);
@@ -630,8 +675,19 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       if (idx < tasks.length) {
         launchNext();
       } else if (running === 0) {
+
+        if (await stopRequested()) {
+          for (const c of children) { try { c.kill('SIGINT'); } catch {} }
+          console.log('[orchestrator] stop requested — skipping merge/cleanup');
+          telemetry.step('done');
+          console.log('[orchestrator] stop requested — halted');
+          await waitForResetThenPreflight();
+          return;
+        }
+
         telemetry.step('merge-urls');
         const uniqueCount = mergeManifestDedup(master, cfg.outDir);
+
         telemetry.bump('urlsFound', uniqueCount);
 
         console.log('[orchestrator] done');
