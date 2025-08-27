@@ -27,3 +27,6 @@ Thumbs.db
 # Local configs
 meta-check.config.json
 .env
+
+#input/output files
+.csv
