@@ -37,6 +37,7 @@ const argv = minimist(process.argv.slice(2), {
 // Resolve paths early so we can share with telemetry
 const inputPath = argv.input ? path.resolve(String(argv.input)) : '';
 const outDirAbs = path.resolve(String(argv.outDir || 'dist'));
+const cfgPath = path.join(outDirAbs, 'telemetry', 'config.json');
 
 // Let telemetry know what we’re launching with (for /preflight CSV sniffing)
 if (typeof tmod.setLaunchContext === 'function') {
@@ -64,6 +65,7 @@ while (true) {
       if (j.started === true) {
         process.env.META_ONLY_REPORTS = j.outputs.join(',');
         const m = j.meta || {};
+
         if (m.base) argv.base = m.base;
         if (m.prefix != null) argv.pathPrefix = m.prefix;
         if (m.outDir) argv.outDir = m.outDir;
@@ -71,6 +73,12 @@ while (true) {
         if (+m.shards > 0) argv.shards = +m.shards;
         if (+m.bucketParts > 0) argv.bucketParts = +m.bucketParts;
         if (m.inputPath) argv.input = m.inputPath;
+
+        // NEW: honor Control Panel “Headless”
+        if (typeof m.headless === 'boolean') {
+          process.env.PLAYWRIGHT_HEADLESS = m.headless ? '1' : '';
+        }
+
         break;
       }
     }
@@ -391,7 +399,10 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
   telemetry.step('seed-scan');
   console.log(`[orchestrator] seed-scan ${seedUrl} to find first-level sections…`);
-  const browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
+  const browser = await chromium.launch({
+    headless: process.env.PLAYWRIGHT_HEADLESS === '1',
+    args: ['--disable-dev-shm-usage']
+  });
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36',
