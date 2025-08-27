@@ -122,7 +122,7 @@ function threadStatus(info = {}) {
 
   STATE.threads[id] = {
     ...prev,
-    ...info,
+    info,
     phase,
     url: info.url || prev.url || '',
   };
@@ -231,7 +231,7 @@ function threadHeartbeat(info = {}) {
   const prev = STATE.threads[id] || {};
   STATE.threads[id] = {
     ...prev,
-    ...info,
+    info,
     url: info.url || prev.url || '',
     phase: info.phase || prev.phase || ''
   };
@@ -930,20 +930,16 @@ const PAGE_HTML = `<!doctype html>
       }
     });
 
+    // EXPLICIT REPLACE for the cp-dirpicker change handler:
     $('cp-browse').addEventListener('click', () => $('cp-dirpicker').click());
     $('cp-dirpicker').addEventListener('change', function(){
-      // When the user picks a folder, the first file has webkitRelativePath like "chosenFolder/…"
       const f = this.files && this.files[0];
       if (f && f.webkitRelativePath) {
         const root = f.webkitRelativePath.split('/')[0] || 'dist';
-        $('cp-outdir').value = './' + root; // auto-fill output field
-        const saved = JSON.parse(localStorage.getItem('mc_ctrl') || '{}');
-        saved.outDir = $('cp-outdir').value;
-        localStorage.setItem('mc_ctrl', JSON.stringify(saved));
+        $('cp-outdir').value = './' + root;         // always set to chosen folder
       }
       recompute();
     });
-
 
     $('cp-newrun').addEventListener('click', async function(){
       try { await fetch('/reset-wait'); } catch {}

@@ -107,7 +107,7 @@ const cfg = {
   keepPageParam: !!argv.keepPageParam,
   shards: Math.min(+argv.shardCap || Infinity, Math.max(1, +argv.shards || os.cpus().length)),
   outDir: path.resolve(String(argv.outDir || 'dist')),
-  childEntry: path.resolve('../index.js'),
+  childEntry: path.resolve('src/index.js'),
 };
 
 // --- Apply "maxShards" if requested by UI
@@ -218,6 +218,14 @@ const prefix   = String(cfg.pathPrefix || '').replace(/^["']|["']$/g, '').replac
 const followup = String(argv.followup || 'none').toLowerCase();
 
 const sniff = parseFirstColumn(inputPath);
+try {
+  if (inputPath) {
+    const preview = (sniff.urls && sniff.urls[0]) ? sniff.urls[0] : '';
+    telemetry.threadStatus({ phase: 'input-confirm', url: preview ? `First URL: ${preview}` : `Input: ${path.basename(inputPath)}` });
+  } else {
+    telemetry.threadStatus({ phase: 'input-confirm', url: 'No input file selected (discovery-only)' });
+  }
+} catch {}
 const sitemapMode = sniff.explicit && sniff.urls.length > 0;
 
 const log = makeLogger({ shardIndex: 'orchestrator', shards: cfg.shards });
@@ -271,6 +279,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         '--outDir', cfg.outDir,
         '--rebuildLinks', argv.rebuildLinks ? 'true' : 'false',
         '--dropCache',   argv.dropCache   ? 'true' : 'false',
+        '--headless', (process.env.PLAYWRIGHT_HEADLESS ? 'true' : 'false'),
         '--headless', String(!!argv.headless),
         '--mode', 'root-urls',
         '--urlsFile', urlsFile,
@@ -633,6 +642,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
     cfg.childEntry,
     '--base', cfg.base,
     '--input', argv.input || 'input.csv',
+    '--headless', (process.env.PLAYWRIGHT_HEADLESS ? 'true' : 'false'),
     '--concurrency', String(argv.concurrency || 4),
     '--keepPageParam', String(cfg.keepPageParam),
     '--outDir', cfg.outDir,
@@ -672,22 +682,20 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         console.warn('[append warn]', String(e && e.message ? e.message : e));
       }
 
-      if (idx < tasks.length) {
+      if (await stopRequested()) {
+        // stop wins immediately: don’t enqueue more work and don’t merge
+        for (const c of children) { try { c.kill('SIGINT'); } catch {} }
+        telemetry.step('done');
+        console.log('[orchestrator] stop requested — halted');
+        await waitForResetThenPreflight();
+        return;
+      } else if (idx < tasks.length) {
+        // keep the pool fed
         launchNext();
       } else if (running === 0) {
-
-        if (await stopRequested()) {
-          for (const c of children) { try { c.kill('SIGINT'); } catch {} }
-          console.log('[orchestrator] stop requested — skipping merge/cleanup');
-          telemetry.step('done');
-          console.log('[orchestrator] stop requested — halted');
-          await waitForResetThenPreflight();
-          return;
-        }
-
+        // finalize the run
         telemetry.step('merge-urls');
         const uniqueCount = mergeManifestDedup(master, cfg.outDir);
-
         telemetry.bump('urlsFound', uniqueCount);
 
         console.log('[orchestrator] done');
@@ -723,6 +731,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         const MM = Math.floor((MS%3600000)/60000);
         const SS = Math.floor((MS%60000)/1000);
         console.log(`[orchestrator] done in ${HH}h ${MM}m ${SS}s (${MS.toLocaleString()} ms)`);
+
         await waitForResetThenPreflight();
       }
     });
