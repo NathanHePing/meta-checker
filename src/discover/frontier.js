@@ -1,0 +1,235 @@
+// src/discover/frontier.js
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const http = require('http');
+const os   = require('os');
+const { exec } = require('child_process');
+
+// --- optional telemetry (safe no-op if module not present) ---
+let telemetry = null;
+try {
+  const mod = require('../utils/telemetry');
+  telemetry = mod && (mod.telemetry || mod.default || mod);
+} catch {}
+const tEmit = (event, ...args) => {
+  try { telemetry && typeof telemetry[event] === 'function' && telemetry[event](...args); } catch {}
+};
+
+function sha1(s){ return crypto.createHash('sha1').update(String(s)).digest('hex'); }
+function u32(s){ const b = Buffer.isBuffer(s) ? s : Buffer.from(s); return b.readUInt32BE(0); }
+function hashUrl(url){ return u32(crypto.createHash('sha1').update(url).digest()); }
+
+// -------- Windows/OneDrive hardening (retry on EBUSY/EPERM) --------
+function sleepMs(ms){ const sab = new SharedArrayBuffer(4); Atomics.wait(new Int32Array(sab), 0, 0, ms); }
+
+function readFileWithRetry(p, encOrOpts = null, tries = 40) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return fs.readFileSync(p, encOrOpts); }
+    catch (e) {
+      if (e && (e.code === 'EBUSY' || e.code === 'EPERM')) { last = e; sleepMs(20 + i * 10); continue; }
+      throw e;
+    }
+  }
+  throw last || new Error(`Failed to read after ${tries} attempts: ${p}`);
+}
+function appendFileWithRetry(p, data, tries = 40) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { fs.appendFileSync(p, data, 'utf8'); return; }
+    catch (e) {
+      if (e && (e.code === 'EBUSY' || e.code === 'EPERM')) { last = e; sleepMs(20 + i * 10); continue; }
+      throw e;
+    }
+  }
+  throw last || new Error(`Failed to append after ${tries} attempts: ${p}`);
+}
+function writeFileWithRetry(p, data, enc = 'utf8', tries = 40) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { fs.writeFileSync(p, data, enc); return; }
+    catch (e) {
+      if (e && (e.code === 'EBUSY' || e.code === 'EPERM')) { last = e; sleepMs(20 + i * 10); continue; }
+      throw e;
+    }
+  }
+  throw last || new Error(`Failed to write after ${tries} attempts: ${p}`);
+}
+function renameWithRetry(from, to, tries = 40) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { fs.renameSync(from, to); return; }
+    catch (e) {
+      if (e && (e.code === 'EBUSY' || e.code === 'EPERM')) { last = e; sleepMs(20 + i * 10); continue; }
+      throw e;
+    }
+  }
+  throw last || new Error(`Failed to rename after ${tries} attempts: ${from} -> ${to}`);
+}
+
+// ---------- Legacy (single-file) helpers kept for backward compat ----------
+function seedFrontier(file, urls) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (!fs.existsSync(file)) writeFileWithRetry(file, urls.map(u => u + '\n').join(''), 'utf8');
+}
+function appendToFrontier(file, urls) {
+  if (!urls?.length) return;
+  appendFileWithRetry(file, urls.map(u => u + '\n').join(''));
+}
+function* readFrontier(file) {
+  if (!fs.existsSync(file)) return;
+  const lines = readFileWithRetry(file, 'utf8').split(/\r?\n/);
+  for (const line of lines) { const u = line.trim(); if (u) yield u; }
+}
+
+function tryClaim(locksDir, url) {
+  fs.mkdirSync(locksDir, { recursive: true });
+  const id = sha1(url);
+  const lockPath = path.join(locksDir, `${id}.lock`);
+  const donePath = path.join(locksDir, `${id}.done`);
+  if (fs.existsSync(donePath)) return null; // already processed
+  try {
+    const fd = fs.openSync(lockPath, 'wx'); // exclusive create
+    fs.writeFileSync(fd, JSON.stringify({ url, at: new Date().toISOString(), pid: process.pid }) + '\n');
+    const complete = () => { try { fs.closeSync(fd); renameWithRetry(lockPath, donePath); } catch {} };
+    const release  = () => { try { fs.closeSync(fd); fs.unlinkSync(lockPath); } catch {} };
+    return { lockPath, donePath, complete, release };
+  } catch {
+    return null; // someone else owns it (or in progress)
+  }
+}
+
+// Legacy claim (modulo on claim) — still exported for compat
+function claimNext(frontierFile, locksDir, partIndex, partTotal, acceptFn) {
+  for (const url of readFrontier(frontierFile)) {
+    if (acceptFn && !acceptFn(url)) continue;
+    if ((hashUrl(url) % partTotal) !== partIndex) continue;
+    const claim = tryClaim(locksDir, url);
+    if (claim) return { url, ...claim };
+  }
+  return null;
+}
+
+// ---------- Bucketed frontier (fast path) ----------
+function bucketFiles(frontierDir, r){
+  fs.mkdirSync(frontierDir, { recursive: true });
+  return {
+    file: path.join(frontierDir, `bucket.${r}.ndjson`),
+    offset: path.join(frontierDir, `bucket.${r}.offset`)
+  };
+}
+
+// ----- Per-bucket owner lock: only one worker scans a bucket at a time -----
+function acquireBucketOwner(frontierDir, r, ownerTag = '') {
+  const assignDir = path.join(frontierDir, 'assign');
+  fs.mkdirSync(assignDir, { recursive: true });
+  const ownerPath = path.join(assignDir, `bucket.${r}.owner`);
+  try {
+    const fd = fs.openSync(ownerPath, 'wx'); // exclusive
+    fs.writeFileSync(
+      fd,
+      JSON.stringify({ r, owner: ownerTag, pid: process.pid, at: new Date().toISOString() }) + '\n'
+    );
+    tEmit('bucketOwner', { bucket: r, owner: ownerTag, phase: 'acquired' });
+    const release = () => {
+      try { fs.closeSync(fd); fs.unlinkSync(ownerPath); } catch {}
+      tEmit('bucketOwner', { bucket: r, owner: ownerTag, phase: 'released' });
+    };
+    return { release };
+  } catch {
+    return null; // someone else owns it right now
+  }
+}
+
+function seedBuckets(frontierDir, urls, parts){
+  if (!urls?.length) return;
+  fs.mkdirSync(frontierDir, { recursive: true });
+  // ensure files exist
+  for (let r=0; r<parts; r++){
+    const { file } = bucketFiles(frontierDir, r);
+    if (!fs.existsSync(file)) writeFileWithRetry(file, '', 'utf8');
+  }
+  appendToBuckets(frontierDir, urls, parts);
+}
+
+function appendToBuckets(frontierDir, urls, parts){
+  if (!urls?.length) return;
+  const perBucket = new Map();
+  for (const raw of urls){
+    if (!raw) continue;
+    const r = hashUrl(raw) % parts;
+    if (!perBucket.has(r)) perBucket.set(r, []);
+    perBucket.get(r).push(raw);
+  }
+  for (const [r, list] of perBucket){
+    const { file } = bucketFiles(frontierDir, r);
+    appendFileWithRetry(file, list.map(u => u + '\n').join(''));
+    tEmit('bucketAppend', { bucket: r, count: list.length });
+  }
+}
+
+/**
+ * Claim next URL for bucket r by reading ONLY new bytes in bucket.r since last cursor.
+ * Returns { url, complete(), release() } or null if no new work right now.
+ */
+function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
+  const { file, offset } = bucketFiles(frontierDir, r);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (!fs.existsSync(file)) writeFileWithRetry(file, '', 'utf8');
+
+  let pos = 0;
+  try { pos = parseInt(readFileWithRetry(offset, 'utf8').trim() || '0', 10) || 0; } catch {}
+
+  const buf = readFileWithRetry(file); // tolerate OneDrive/AV locks
+  if (pos >= buf.length) {
+    tEmit('bucketProgress', { bucket: r, cursor: pos, size: buf.length });
+    return null; // nothing new
+  }
+
+  const tail = buf.toString('utf8', pos);
+  const lines = tail.split(/\r?\n/);
+  let advanced = 0;
+
+  for (let i=0; i<lines.length; i++){
+    const line = lines[i];
+    const withNl = i < lines.length - 1 ? line + '\n' : line; // last item may not end with NL
+    const inc = Buffer.byteLength(withNl, 'utf8');
+    const url = line.trim();
+    advanced += inc;
+
+    if (!url) continue;
+    if (acceptFn && !acceptFn(url)) continue;
+
+    const claim = tryClaim(locksDir, url);
+    if (claim) {
+      // advance cursor THROUGH the claimed line
+      const newPos = pos + advanced;
+      try { writeFileWithRetry(offset, String(newPos), 'utf8'); } catch {}
+      tEmit('bucketProgress', { bucket: r, cursor: newPos, size: buf.length, claimed: true });
+      return { url, ...claim };
+    }
+  }
+
+  // consumed all new lines, advance cursor to EOF
+  try { writeFileWithRetry(offset, String(buf.length), 'utf8'); } catch {}
+  tEmit('bucketProgress', { bucket: r, cursor: buf.length, size: buf.length });
+  return null;
+}
+
+module.exports = {
+  // legacy
+  seedFrontier,
+  appendToFrontier,
+  claimNext,
+  hashUrl,
+
+  // bucketed
+  seedBuckets,
+  appendToBuckets,
+  claimNextBucket,
+  acquireBucketOwner,
+};

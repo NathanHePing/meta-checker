@@ -1,0 +1,38 @@
+{
+  "name": "meta-checker-ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GUI wrapper for check-meta-auto.flex.js",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node app.js",
+    "build:exe:win": "set PLAYWRIGHT_BROWSERS_PATH=0&& npm run postinstall:playwright && pkg . --targets node18-win-x64 --output MetaChecker.exe",
+    "postinstall:playwright": "npx playwright install chromium",
+    "auto": "node scripts/shard-run.js --",
+    "auto:fast": "node scripts/shard-run.js -- --metaStrategy http --linksMode none",
+    "auto:full": "node scripts/shard-run.js -- --dropCache true --rebuildLinks true"
+  },
+  "bin": {
+    "meta-checker": "app.js"
+  },
+  "dependencies": {
+    "archiver": "^6.0.2",
+    "dotenv": "^16.4.5",
+    "minimist": "^1.2.8",
+    "open": "^10.1.0",
+    "playwright": "^1.46.0"
+  },
+  "devDependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*",
+      "check-meta-auto.flex.js"
+    ]
+  }
+}

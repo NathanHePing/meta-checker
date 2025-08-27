@@ -1,0 +1,19 @@
+=== SUMMARY ===
+Correct rows: 0
+Titles not found: 5
+Ambiguous/fuzzy matches: 0
+Mismatches (desc only): 0
+Mismatches (other): 0
+Duplicate titles detected: 5
+Extras (pages on site not in input by undefined): 189
+
+correct.csv:               C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\correct.csv
+mismatches-desc-only.csv:  C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\mismatches-desc-only.csv
+mismatches-other.csv:      C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\mismatches-other.csv
+not-found.csv:             C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\not-found.csv
+ambiguous-fuzzy.csv:       C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\ambiguous-fuzzy.csv
+duplicate-titles.csv:      C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\duplicate-titles.csv
+extras-not-in-input.csv:   C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\extras-not-in-input.csv
+internal-links.csv:        C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\internal-links.csv
+internal-links.json:       C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\internal-links.json
+titles-debug.csv:          C:\Users\nathanhe\OneDrive - PING\GitHub\ping-meta-checker\meta-check\titles-debug.csv
