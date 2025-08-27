@@ -8,6 +8,14 @@ const crypto = require('crypto');
 
 const tmod = require('./utils/telemetry');
 const telemetry = tmod.telemetry || tmod;
+// Check the stop flag that the telemetry server writes
+function stopRequested(outDir) {
+  try {
+    const f = path.join(outDir || 'dist', 'telemetry', 'stop.flag');
+    return fs.existsSync(f);
+  } catch { return false; }
+}
+
 
 const { extractInternalLinks } = require('./extract/links');
 const { parseCsv } = require('./io/csv');
@@ -198,6 +206,17 @@ async function run(cfg) {
     if (cfg.input && fs.existsSync(cfg.input)) {
       inputExists = true;
       rows = parseCsv(cfg.input, 'auto'); // tolerant header handling
+      // --- UI: show the first line of the input so users can confirm ---
+    try {
+      const first = rows && rows.length ? rows[0] : null;
+      const preview = first
+        ? Array.isArray(first)
+            ? first.slice(0, 3).join(' | ')
+            : Object.values(first).slice(0, 3).join(' | ')
+        : '(empty)';
+      telemetry.threadStatus({ workerId: cfg.workerId, phase: 'input-confirm', url: `Input: ${path.basename(cfg.input)} — ${preview}` });
+    } catch {}
+
     }
   } catch (e) {
     log.warn('Failed to read input CSV; continuing as no-input', { err: String(e && e.message ? e.message : e) });
@@ -206,6 +225,14 @@ async function run(cfg) {
   // If orchestrator passed a urlsFile, use it (highest priority)
   let urls = [];
   const usingUrlsFile = (cfg.urlsFile && fs.existsSync(cfg.urlsFile));
+  try {
+    telemetry.event({
+      type: 'mode',
+      sitemapMode: !!sitemapMode,
+      usingUrlsFile: !!usingUrlsFile,
+      urlCount: Array.isArray(urls) ? urls.length : 0
+    });
+  } catch {}
   if (usingUrlsFile) {
     urls = JSON.parse(fs.readFileSync(cfg.urlsFile, 'utf8'));
     log.info('Loaded shard URLs from file', { file: cfg.urlsFile, count: urls.length });
@@ -471,8 +498,13 @@ if (!usingUrlsFile && !sitemapMode) {
   const out = [];
   const conc = Math.max(1, Number(cfg.concurrency || 4));
   for (let i = 0; i < toFetch.length; i += conc) {
+  if (stopRequested(cfg.outDir)) {
+    try { telemetry.threadStatus({ workerId: cfg.workerId, phase: 'stopped', url: '' }); } catch {}
+    break;
+  }
     const slice = toFetch.slice(i, i + conc);
     await Promise.all(slice.map(async (seedUrl) => {
+      if (stopRequested(cfg.outDir)) return;
       const seedKey = normalizeUrl(seedUrl, { keepPageParam: cfg.keepPageParam });
       const seedClaim = claimUrl(cfg.locksDir, seedKey);
       if (!seedClaim) return; // someone else has it
@@ -511,6 +543,13 @@ if (!usingUrlsFile && !sitemapMode) {
               return { title, description };
             });
             final = page.url();
+            // --- UI: contribute to the live Tree view ---
+            try {
+              const u = new URL(final);
+              const segs = u.pathname.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+              if (segs.length && telemetry.treeAdd) telemetry.treeAdd(segs);
+            } catch {}
+
             break;
           } catch (e) {
             if (attempt === 2) {
@@ -575,6 +614,7 @@ if (!usingUrlsFile && !sitemapMode) {
         try { await page.close(); } catch {}
         try { if (finalClaim) finalClaim.release(); } catch {}
         try { seedClaim.release(); } catch {}
+        try { telemetry.threadStatus({ workerId: (cfg.workerId ?? cfg.shardIndex ?? 1), phase: 'fetched', url: final || seedUrl }); } catch {}
       }
     }));
 

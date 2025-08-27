@@ -22,6 +22,15 @@ async function draw(){
   const startedAt = state.startedAt || Date.now();
   const dur = fmtMs(Date.now() - startedAt);
   const steps = (state.stepper && state.stepper.steps) || [];
+  const STEP_HELP = {
+    'seed-scan':   'Scan base URL to find top-level sections (first seeds).',
+    'discover':    'Crawl site to discover URLs (respects pathPrefix, robots, and de-dupes).',
+    'fetch':       'Open pages in headless browser and collect meta/title/links.',
+    'compare':     'Compare fetched meta to your input CSV/TSV titles and descriptions.',
+    'merge-urls':  'Merge per-worker URL parts into a unique final URL list.',
+    'cleanup':     'Remove temp artifacts and write final reports.',
+    'done':        'Run completed. Reports are ready in the output folder.',
+  };
   const cur   = (state.stepper && state.stepper.currentIndex) || 0;
 
 

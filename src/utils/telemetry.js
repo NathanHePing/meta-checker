@@ -48,6 +48,14 @@ function comparisonEnabledByShape(shape) {
 
 function validateOutputs(selected, shape) {
   const errors = [];
+  if (selected.includes('existence_csv')) {
+    if (!shape.exists) {
+      errors.push({ key: 'existence_csv', reason: 'No input file provided, but “existence.csv” needs an input list.' });
+    } else if (shape.firstColUrlShare < 0.6) {
+      errors.push({ key: 'existence_csv', reason: 'The first column does not look like URLs. Provide a URL list for “existence.csv”.' });
+    }
+  }
+
   if (selected.includes('existence_csv') && !shape.exists) {
     errors.push({ key: 'existence_csv', reason: 'No input file found. Provide a CSV or uncheck this output.' });
   }
@@ -111,9 +119,8 @@ function step(name) {
 // replace your threadStatus with this
 function threadStatus(info = {}) {
   if (postToParent('thread', { info })) return;
-  const id = info.workerId != null ? String(info.workerId)
-           : info.pid ? String(info.pid)
-           : 'self';
+  if (info == null || (info.workerId == null && info.pid == null)) return;
+  const id = info.workerId != null ? String(info.workerId) : String(info.pid);
   const prev = STATE.threads[id] || {};
 
   const phase = info.phase != null ? info.phase
@@ -238,6 +245,9 @@ function threadHeartbeat(info = {}) {
 }
 
 function bucketUpdate(r, data = {}) {
+  if (r == null) return;
+  const key = String(r);
+  if (key === '' || key === 'undefined') return;
   const k = String(r);
   const prev = STATE.buckets[k] || {};
   STATE.buckets[k] = { ...prev, ...data };
@@ -264,7 +274,15 @@ function treeAdd(pathSegs) {
 function snapshot() {
   const tree = {};
   for (const [k, set] of Object.entries(STATE.tree)) tree[k] = Array.from(set);
-  const snap = { ...STATE, upTime: nowHMS(), tree };
+
+  // Pull latest meta so UI links always use the current base/prefix
+  let meta = { base: '', prefix: '' };
+  try {
+    const file = readConfigFile();
+    if (file && file.meta) meta = { base: String(file.meta.base || ''), prefix: String(file.meta.prefix || '') };
+  } catch {}
+
+  const snap = { ...STATE, upTime: nowHMS(), tree, meta };
 
   try {
     const outDir = path.resolve((LAUNCH.outDir || 'dist'), 'telemetry');
@@ -274,6 +292,7 @@ function snapshot() {
 
   return snap;
 }
+
 
 
 // ---------- HTTP server & UI ----------
@@ -842,7 +861,8 @@ const PAGE_HTML = `<!doctype html>
     function recompute(){
       const s = state();
       $('cp-shard-col').style.display = s.multi ? '' : 'none';
-      $('cp-buckets').textContent = String(s.buckets);
+      const bucketKeys = Object.keys(s.buckets || {}).filter(k => k && k !== 'undefined');
+      $('m-buckets').textContent = String(bucketKeys.length);
 
       // Show/Hide “Max shards (auto)” checkbox with multi only
       $('cp-maxshards').closest('.cp-col').style.display = s.multi ? '' : 'none';
@@ -998,7 +1018,10 @@ const PAGE_HTML = `<!doctype html>
       $('m-urls').textContent = String((s.totals && s.totals.urlsFound) || 0);
       $('m-edges').textContent = String((s.totals && s.totals.internalEdges) || 0);
       const threadList = Object.values(s.threads || {});
-      $('m-threads').textContent = String(threadList.length);
+      const liveThreads = (Object.values(s.threads || {})).filter(t =>
+        t && t.info && (t.info.workerId != null || t.info.pid != null) && t.phase !== 'input-confirm'
+      );
+      $('m-threads').textContent = String(liveThreads.length);
       $('m-buckets').textContent = String(Object.keys(s.buckets || {}).length);
 
       const stepper = $('stepper'); stepper.innerHTML = '';

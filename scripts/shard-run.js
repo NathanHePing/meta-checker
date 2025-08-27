@@ -14,6 +14,10 @@ const { seedBuckets, appendToBuckets } = require('../src/discover/frontier');
 const { makeLogger } = require('../src/utils/log');
 const { sanitizePathPrefix } = require('../src/config');
 const { parseCsv } = require('../src/io/csv');
+const dedupe = (arr) => Array.from(new Set(arr || []));
+if (typeof global.fetch !== 'function') {
+  global.fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+}
 
 const tmod = require('../src/utils/telemetry');
 const telemetry = tmod.telemetry || tmod;
@@ -44,6 +48,21 @@ if (typeof tmod.setLaunchContext === 'function') {
   tmod.setLaunchContext({ inputPath, outDir: outDirAbs });
 }
 
+function mergeManifestDedup(masterFile, outDir) {
+  try {
+    const txt = fs.existsSync(masterFile) ? fs.readFileSync(masterFile, 'utf8') : '';
+    const urls = txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const unique = Array.from(new Set(urls));
+    const out = path.join(outDir, 'urls-final.txt');
+    fs.writeFileSync(out, unique.join('\n') + '\n', 'utf8');
+    return unique.length;
+  } catch (e) {
+    console.warn('[merge warn]', e && e.message ? e.message : e);
+    return 0;
+  }
+}
+
+
 // -------------------- start telemetry --------------------
 const requestedPort = Number(argv.telemetryPort || process.env.TELEMETRY_PORT || 7077);
 const TELEMETRY_PORT = telemetry.startServer({ port: requestedPort, autoOpen: !!argv.open }) || requestedPort;
@@ -68,6 +87,10 @@ async function stopRequested() {
 
 console.log('[orchestrator] waiting for output selection in the web UI…');
 while (true) {
+  if (await stopRequested()) {
+    console.log('[orchestrator] stop requested — exiting before start');
+    return;
+  }
   try {
     const r = await fetch(`http://127.0.0.1:${TELEMETRY_PORT}/preflight`, { cache: 'no-store' });
     if (!r.ok) throw 0;
@@ -219,14 +242,38 @@ const followup = String(argv.followup || 'none').toLowerCase();
 
 const sniff = parseFirstColumn(inputPath);
 try {
-  if (inputPath) {
-    const preview = (sniff.urls && sniff.urls[0]) ? sniff.urls[0] : '';
-    telemetry.threadStatus({ phase: 'input-confirm', url: preview ? `First URL: ${preview}` : `Input: ${path.basename(inputPath)}` });
-  } else {
-    telemetry.threadStatus({ phase: 'input-confirm', url: 'No input file selected (discovery-only)' });
-  }
-} catch {}
+    if (inputPath) {
+      // Read the first non-empty line for human verification in the UI
+      let firstLine = '';
+      if (firstLine) {
+        telemetry.threadStatus({ workerId: 0, phase: 'input-confirm', status: 'ok', firstLine });
+      }
+
+      try {
+        const raw = fs.readFileSync(inputPath, 'utf8');
+        firstLine = (raw.split(/\r?\n/).find(l => l.trim().length) || '').slice(0, 400);
+      } catch {}
+      const previewUrl = (sniff.urls && sniff.urls[0]) ? sniff.urls[0] : '';
+
+      telemetry.threadStatus({
+        phase: 'input-confirm',
+        url: previewUrl ? `First URL: ${previewUrl}` : `Input: ${path.basename(inputPath)}`
+      });
+
+      // Also send a dedicated event payload for a tiny panel
+      telemetry.event({ type: 'input/preview', file: path.basename(inputPath), firstLine });
+    } else {
+      telemetry.threadStatus({ phase: 'input-confirm', url: 'No input file selected (discovery-only)' });
+    }
+  } catch {}
+
 const sitemapMode = sniff.explicit && sniff.urls.length > 0;
+telemetry.event({
+  type: 'mode',
+  sitemapMode,
+  urlCount: sniff.urls.length,
+  explicit: sniff.explicit
+});
 
 const log = makeLogger({ shardIndex: 'orchestrator', shards: cfg.shards });
 console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().length} → shards=${cfg.shards}`, {});
@@ -280,7 +327,6 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         '--rebuildLinks', argv.rebuildLinks ? 'true' : 'false',
         '--dropCache',   argv.dropCache   ? 'true' : 'false',
         '--headless', (process.env.PLAYWRIGHT_HEADLESS ? 'true' : 'false'),
-        '--headless', String(!!argv.headless),
         '--mode', 'root-urls',
         '--urlsFile', urlsFile,
         '--pathPrefix', prefix || '/',
@@ -298,8 +344,14 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         stdio: 'inherit',
         env: { ...process.env, TELEMETRY_PORT: String(TELEMETRY_PORT) }
       });
+      const killer = setInterval(async () => {
+        if (await stopRequested()) {
+          try { child.kill('SIGINT'); } catch {}
+        }
+      }, 500);
       children.add(child);
       child.on('exit', async (code) => {
+        clearInterval(killer);
         children.delete(child);
         finished++;
         telemetry.threadStatus({ workerId: i + 1, phase: 'exit:root-urls', done: true, code });
@@ -415,6 +467,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       const SS = Math.floor((MS%60000)/1000);
       console.log(`[orchestrator] done in ${HH}h ${MM}m ${SS}s (${MS.toLocaleString()} ms)`);
       // Wait for reset, then allow another run
+      try { if (global.__mc_visibleBrowser) { await global.__mc_visibleBrowser.close(); global.__mc_visibleBrowser = null; } } catch {}
       await waitForResetThenPreflight();
       return;
     }
@@ -446,6 +499,13 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   };
 
   const seedUrl = new URL(prefix || '/', cfg.base).toString();
+
+  if (await stopRequested()) {
+    telemetry.step('done');
+    console.log('[orchestrator] stop requested — exiting before seed-scan');
+    return;
+  }
+
 
   telemetry.step('seed-scan');
   console.log(`[orchestrator] seed-scan ${seedUrl} to find first-level sections…`);
@@ -564,8 +624,13 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
     filtered = [];
   } finally {
     try { await context.close(); } catch {}
-    try { await browser.close(); } catch {}
+    if (process.env.PLAYWRIGHT_HEADLESS === '1') {
+     try { await browser.close(); } catch {}
+   } else {
+     global.__mc_visibleBrowser = browser;
+   }
   }
+
 
   if (!sections.length && !rootUrls.length) rootUrls = [seedUrl];
 
@@ -576,10 +641,24 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   const sectionUrls = sections.map(s => new URL(`${prefix}/${s}`.replace(/\/+/g,'/'), cfg.base).toString());
   const bootstrapSeeds = Array.from(new Set([seedUrl, ...rootUrls, ...sectionUrls, ...filtered]));
   if (bootstrapSeeds.length) {
-    seedBuckets(frontierDir, [seedUrl0], bucketParts);
+    appendToBuckets(frontierDir, bootstrapSeeds);
+    // Announce bucket ownership/initial progress so the Buckets panel isn't empty
+    try {
+      const files = fs.readdirSync(frontierDir).filter(f => /^bucket\.\d+\.ndjson$/i.test(f));
+      for (const f of files) {
+        const m = f.match(/bucket\.(\d+)\.ndjson/i);
+        if (!m) continue;
+        const r = Number(m[1]);
+        // owner "none" at bootstrap, 0 processed/pending unknown (UI will update when workers claim)
+        if (telemetry.bucketOwner) telemetry.bucketOwner(r, 'none');
+        if (telemetry.bucketProgress) telemetry.bucketProgress(r, 0, 0);
+      }
+    } catch {}
+
     telemetry.step('bootstrap-frontier');
     console.log('[orchestrator] bootstrap frontier +', bootstrapSeeds.length, 'seeds');
   }
+
 
   // --- tasks: N frontier workers ---
   const parts = cfg.shards;
@@ -633,7 +712,10 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   let running = 0, idx = 0;
 
   async function launchNext() {
-    if (await stopRequested()) return;
+    if (await stopRequested()) {
+      console.log('[orchestrator] stop requested — not launching new tasks');
+      return;
+    }
     if (idx >= tasks.length) return;
     const t = tasks[idx++];
     running++;
@@ -653,14 +735,28 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
     console.log('[orchestrator] spawn', t.kind, t.section ? t.section : '', childArgs.slice(1).join(' '));
     telemetry.threadStatus({ workerId: t.workerId, phase: `spawn:${t.kind}`, url: t.section || '' });
+    // If this task will read a specific bucket range, mark ownership (best effort)
+    if (telemetry.bucketOwner && t.argv.includes('--partIndex') && t.argv.includes('--bucketParts')) {
+      const partIdx = Number(t.argv[t.argv.indexOf('--partIndex') + 1] || 0);
+      const parts   = Number(t.argv[t.argv.indexOf('--partTotal') + 1] || 1);
+      // naive: label a "range" owner; real per-bucket claims should happen in workers
+      telemetry.bucketOwner(`${partIdx+1}/${parts}`, `W${t.workerId}`);
+    }
+
 
     const child = fork(childArgs[0], childArgs.slice(1), {
       stdio: 'inherit',
       env: { ...process.env, TELEMETRY_PORT: String(TELEMETRY_PORT) }
     });
+    const killer = setInterval(async () => {
+      if (await stopRequested()) {
+        try { child.kill('SIGINT'); } catch {}
+      }
+    }, 500);
     children.add(child);
 
     child.on('exit', async (code) => {
+      clearInterval(killer);
       children.delete(child);
       running--;
       telemetry.threadStatus({ workerId: t.workerId, phase: `exit:${t.kind}`, done: true, code });
@@ -687,6 +783,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         for (const c of children) { try { c.kill('SIGINT'); } catch {} }
         telemetry.step('done');
         console.log('[orchestrator] stop requested — halted');
+        try { if (global.__mc_visibleBrowser) { await global.__mc_visibleBrowser.close(); global.__mc_visibleBrowser = null; } } catch {}
         await waitForResetThenPreflight();
         return;
       } else if (idx < tasks.length) {
@@ -731,7 +828,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         const MM = Math.floor((MS%3600000)/60000);
         const SS = Math.floor((MS%60000)/1000);
         console.log(`[orchestrator] done in ${HH}h ${MM}m ${SS}s (${MS.toLocaleString()} ms)`);
-
+        try { if (global.__mc_visibleBrowser) { await global.__mc_visibleBrowser.close(); global.__mc_visibleBrowser = null; } } catch {}
         await waitForResetThenPreflight();
       }
     });
@@ -742,6 +839,26 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   console.error('orchestrator fatal:', (e && e.stack) || e);
   process.exit(1);
 });
+
+// Wait until the Telemetry UI is back in preflight (not started)
+async function waitForPreflightReady() {
+  const port = Number(process.env.TELEMETRY_PORT || 0);
+  if (!port) return;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  while (true) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/preflight`, { cache: 'no-store' });
+      if (r.ok) {
+        const j = await r.json();
+        // Preflight is "ready" when started === false
+        if (j && j.started === false) return;
+      }
+    } catch {}
+    await sleep(600);
+  }
+}
+
+
 
 async function waitForResetThenPreflight() {
   const port = Number(process.env.TELEMETRY_PORT || 0);

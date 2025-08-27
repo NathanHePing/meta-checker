@@ -80,6 +80,18 @@ const {
   acquireBucketOwner
 } = require('./frontier');
 
+async function stopRequested() {
+  const port = Number(process.env.TELEMETRY_PORT || 0);
+  if (!port) return false;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/stop-state`, { cache: 'no-store' });
+    if (!r.ok) return false;
+    const j = await r.json();
+    return !!(j && j.stop);
+  } catch { return false; }
+}
+
+
 /**
  * Crawl the site and return a de-duplicated array of normalized URLs.
  *
@@ -383,6 +395,7 @@ async function crawlSite(context, base, opts) {
 
       try {
         while (results.size < maxPages) {
+          if (await stopRequested()) { log.info('stop requested — worker exiting'); break; }
           T.thread({ workerId: myWorkerId, phase: 'bucket', bucket: r });
 
           const claim = claimNextBucket(
@@ -449,6 +462,7 @@ async function crawlSite(context, base, opts) {
 
 
             try { complete(); } catch {}
+            try { T.progress(r, { processed: 1 }); } catch {}
           } catch (e) {
             log.warn('X error on ' + url + ': ' + String((e && e.message) || e).split('\n')[0]);
           } finally {
@@ -610,6 +624,7 @@ async function crawlSite(context, base, opts) {
   log.info(`Crawling (maxPages=${maxPages}) starting at: ${JSON.stringify(starts)} ...`);
 
   while (queue.length && urls.length < maxPages) {
+    if (await stopRequested()) { log.info('stop requested — BFS exiting'); break; }
     const next = queue.shift();
     if (!next || seen.has(next)) continue;
     seen.add(next);
