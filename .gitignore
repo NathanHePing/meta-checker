@@ -1,0 +1,29 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build / output
+dist/
+cache/
+*.log
+
+# Telemetry + lock artifacts
+telemetry/
+locks/
+disco-locks/
+frontier/
+frontier.ndjson
+
+# OS / Editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local configs
+meta-check.config.json
+.env
