@@ -55,22 +55,26 @@ function frontierSnapshot(frontierDir, discoLocks) {
   }
 }
 
-// content-based emptiness check (ignores mtime flapping)
-function bucketStats(frontierDir) {
+// cheap “pending work” snapshot using size - offset per bucket
+function pendingBytesAll(frontierDir) {
   try {
-    let lines = 0, bytes = 0;
+    const parts = [];
     for (const f of fs.readdirSync(frontierDir)) {
-      if (!/^bucket\.\d+\.ndjson$/i.test(f)) continue;
-      const p = path.join(frontierDir, f);
-      const txt = readFileWithRetry(p, 'utf8');
-      bytes += Buffer.byteLength(txt);
-      lines += txt.split(/\r?\n/).filter(Boolean).length;
+      const m = f.match(/^bucket\.(\d+)\.ndjson$/i);
+      if (!m) continue;
+      const r = Number(m[1]);
+      const file   = path.join(frontierDir, f);
+      const offset = path.join(frontierDir, `bucket.${r}.offset`);
+      const size = fs.statSync(file).size;
+      let pos = 0;
+      try { pos = parseInt(readFileWithRetry(offset, 'utf8').trim() || '0', 10) || 0; } catch {}
+      parts.push({ r, pending: Math.max(0, size - pos) });
     }
-    return { lines, bytes };
-  } catch {
-    return { lines: 0, bytes: 0 };
-  }
+    return parts;
+  } catch { return []; }
 }
+
+
 
 const {
   appendToFrontier,
@@ -107,7 +111,7 @@ async function crawlSite(context, base, opts) {
   opts = opts || {};
   const {
     // scope
-    pathPrefix     = '/en-us',
+    pathPrefix     = '/',
     maxPages       = 50000,
     keepPageParam  = false,
 
@@ -182,7 +186,7 @@ async function crawlSite(context, base, opts) {
       if (pathPrefix && !u.pathname.startsWith(pathPrefix)) return null;
 
       // drop obvious non-HTML assets
-      if (/\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|css|js|woff2?|ttf|otf)(\?|$)/i.test(u.toString())) return null;
+      if (/\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|avi|mov|woff2?|ttf|otf)(\?|$)/i.test(u)) return null;
 
       normalizeQuery(u);
       return u.toString();
@@ -295,7 +299,7 @@ async function crawlSite(context, base, opts) {
   }
 
   // trigger client routers without leaving the page
-  async function probeSpa(page, limit = 60) {
+  async function probeSpa(page, limit = 50000) {
     const clickables = await page.$$('a[href], [role="link"], [data-href], [data-url], [role="menuitem"]');
     for (const el of clickables.slice(0, limit)) {
       try { await el.click({ timeout: 300 }); } catch {}
@@ -408,7 +412,7 @@ async function crawlSite(context, base, opts) {
 
           if (!claim) {
             localIdle++;
-            if (localIdle >= 6) break;               // release bucket so others can try it
+            if (localIdle >= 3) break;               // release bucket so others can try it
             await new Promise(res => setTimeout(res, 100));
             continue;
           }
@@ -421,7 +425,7 @@ async function crawlSite(context, base, opts) {
           try {
             T.thread({ workerId: myWorkerId, phase: 'fetch', url });
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-            try { await page.waitForLoadState('networkidle', { timeout: 3000 }); } catch {}
+            try { await page.waitForLoadState('networkidle', { timeout: 5000 }); } catch {}
             const finalNorm = acceptAndNormalize(page.url(), origin);
             if (finalNorm) {
               results.add(finalNorm);
@@ -460,9 +464,16 @@ async function crawlSite(context, base, opts) {
               } catch {}
             }
 
-
             try { complete(); } catch {}
-            try { T.progress(r, { processed: 1 }); } catch {}
+            try {
+              // compute fresh pending for this bucket (size - new offset)
+              const file   = path.join(frontierDir, `bucket.${r}.ndjson`);
+              const offset = path.join(frontierDir, `bucket.${r}.offset`);
+              const size   = fs.existsSync(file) ? fs.statSync(file).size : 0;
+              let pos = 0; try { pos = parseInt(readFileWithRetry(offset, 'utf8').trim() || '0', 10) || 0; } catch {}
+              T.progress(r, { processed: 1, pending: Math.max(0, size - pos), last: url });
+            } catch {}
+
           } catch (e) {
             log.warn('X error on ' + url + ': ' + String((e && e.message) || e).split('\n')[0]);
           } finally {
@@ -492,37 +503,55 @@ async function crawlSite(context, base, opts) {
 
       // 2) opportunistic steal: try any bucket
       for (const r of allBuckets) {
-        const used = await tryOneBucket(r);
-        if (used) { didWork = true; break; }
+        if (!preferred.includes(r)) {
+          const used = await tryOneBucket(r);
+          if (used) {
+            didWork = true;
+            try { T.event({ type:'bucket/steal', workerId: myWorkerId, from: r }); } catch {}
+            break;
+          }
+        }
       }
+
       if (didWork) { idleCycles = 0; stableCycles = 0; continue; }
 
-      // 3) nothing to do; check if frontier is globally quiet
+      // 3) nothing to do; check if frontier is globally quiet (cheap)
       idleCycles++;
       const snap = frontierSnapshot(frontierDir, discoLocks);
       stableCycles = (snap && snap === lastSnap) ? (stableCycles + 1) : 0;
       lastSnap = snap;
+      try { T.thread({ workerId: myWorkerId, phase: 'idle' }); } catch {}
 
-      // hard quiescence — all buckets empty and no locks => we are done
-      const pending  = bucketStats(frontierDir);
-      const locksNow = countLocks(discoLocks);
-      if (pending.lines === 0 && locksNow === 0) {
-        if (stableCycles >= 5 || idleCycles >= 50) {
-          log.info('frontier empty — exiting', { me, seen: results.size, bytes: pending.bytes, stableCycles, idleCycles });
+      const pendParts = pendingBytesAll(frontierDir);
+      const totalPend = pendParts.reduce((s,x)=>s+x.pending,0);
+      const locksNow  = countLocks(discoLocks);
+
+      // Be more patient before declaring quiescence.
+      if (totalPend === 0 && locksNow === 0) {
+        // ~30s of stable emptiness or ~90s of total idling
+        if (stableCycles >= 150 || idleCycles >= 450) {
+          log.info('frontier empty — exiting', {
+            me, seen: results.size, pendingBytes: totalPend,
+            stableCycles, idleCycles
+          });
           break;
         }
       }
 
+      // Periodic diagnostics every ~10s of idle
       if (idleCycles % 50 === 0) {
         const locks = countLocks(discoLocks);
         log.info('frontier idle', { me, seen: results.size, locks });
-        T.event({ type: 'bucket/switch', workerId: myWorkerId });
+        try { T.event({ type: 'bucket/switch', workerId: myWorkerId }); } catch {}
       }
-      if (stableCycles >= 60) {
+
+      // absolute cap ~2 minutes of stable quiet
+      if (stableCycles >= 600) {
         const locks = countLocks(discoLocks);
         log.info('frontier settled — exiting', { me, seen: results.size, locks });
         break;
       }
+
 
       await new Promise(res => setTimeout(res, 200));
     }

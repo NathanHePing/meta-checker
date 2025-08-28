@@ -24,20 +24,79 @@ const OUTPUTS = [
 
 function sniffCsvShape(filePath) {
   try {
-    if (!filePath || !fs.existsSync(filePath)) return { exists: false, cols: 0, firstColUrlShare: 0, firstRowIsUrl: false };
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const firstLine = (raw.split(/\r?\n/).find(Boolean) || '');
-    const cols = firstLine.split(/,|\t/).length;
-    const lines = raw.split(/\r?\n/).slice(0, 50).filter(Boolean);
-    const firstCol = lines.map(l => (l.split(/,|\t/)[0] || '').trim());
-    const urlish = s => /^(https?:)?\/\//i.test(s) || s.startsWith('/');
-    const firstColUrlShare = firstCol.length ? firstCol.filter(urlish).length / firstCol.length : 0;
-    const firstRowIsUrl = urlish(firstCol[0] || '');
-    return { exists: true, cols, firstColUrlShare, firstRowIsUrl };
+    // Harden: coerce to string, trim, and bail if empty or missing on disk
+    const p = String(filePath || '').trim();
+    if (!p) {
+      return { exists: false, cols: 0, firstColUrlShare: 0, firstRowIsUrl: false, inferredRoles: [] };
+    }
+    try {
+      if (!fs.existsSync(p)) {
+        return { exists: false, cols: 0, firstColUrlShare: 0, firstRowIsUrl: false, inferredRoles: [] };
+      }
+    } catch {
+      return { exists: false, cols: 0, firstColUrlShare: 0, firstRowIsUrl: false, inferredRoles: [] };
+    }
+
+    // Read and trim BOM
+    const raw = fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '');
+
+    // Keep first 50 non-empty rows
+    const lines = raw.split(/\r?\n/).filter(l => l.trim()).slice(0, 50);
+    if (!lines.length) {
+      return { exists: false, cols: 0, firstColUrlShare: 0, firstRowIsUrl: false, inferredRoles: [] };
+    }
+
+    // Auto-detect delimiter (comma, tab, semicolon)
+    const delims = [',', '\t', ';'];
+    let bestDelim = ',', maxCols = 0;
+    for (const d of delims) {
+      const c = lines[0].split(d).length;
+      if (c > maxCols) { maxCols = c; bestDelim = d; }
+    }
+
+    const rows = lines.map(l => l.split(bestDelim));
+    const cols = maxCols;
+
+    const isUrl = (s) => {
+      if (!s) return false;
+      const t = String(s).trim();
+      return /^(https?:)?\/\//i.test(t) || t.startsWith('/');
+    };
+
+    const firstColUrlShare = rows.filter(r => isUrl(r[0] || '')).length / rows.length;
+    const firstRowIsUrl    = isUrl(rows[0][0] || '');
+
+    // Infer roles
+    let roles = [];
+    if (cols === 3) {
+      roles = ['url', 'title', 'description'];
+    } else if (cols === 2) {
+      const col1Url = rows.filter(r => isUrl(r[0] || '')).length / rows.length;
+      const col2Url = rows.filter(r => isUrl(r[1] || '')).length / rows.length;
+      if (col1Url > 0.6 && col2Url < 0.3) {
+        const avgLen = rows.reduce((s, r) => s + String(r[1] || '').length, 0) / rows.length;
+        roles = ['url', avgLen < 120 ? 'title' : 'description'];
+      } else if (col1Url < 0.3 && col2Url < 0.3) {
+        roles = ['title', 'description'];
+      } else {
+        // Fallback: ambiguous 2-col → no roles (preflight will warn)
+        roles = [];
+      }
+    } else if (cols === 1) {
+      if (firstColUrlShare >= 0.6) {
+        roles = ['url'];
+      } else {
+        const avg = rows.reduce((s, r) => s + String(r[0] || '').length, 0) / rows.length;
+        roles = [avg < 120 ? 'title' : 'description'];
+      }
+    }
+
+    return { exists: true, cols, firstColUrlShare, firstRowIsUrl, inferredRoles: roles };
   } catch {
-    return { exists: false, cols: 0, firstColUrlShare: 0, firstRowIsUrl: false };
+    return { exists: false, cols: 0, firstColUrlShare: 0, firstRowIsUrl: false, inferredRoles: [] };
   }
 }
+
 
 function comparisonEnabledByShape(shape) {
   // allow 2-col CSVs; 1-col cannot support comparison; 3+ col treated as explicit lists (no compare)
@@ -48,22 +107,39 @@ function comparisonEnabledByShape(shape) {
 
 function validateOutputs(selected, shape) {
   const errors = [];
-  if (selected.includes('existence_csv')) {
-    if (!shape.exists) {
-      errors.push({ key: 'existence_csv', reason: 'No input file provided, but “existence.csv” needs an input list.' });
-    } else if (shape.firstColUrlShare < 0.6) {
-      errors.push({ key: 'existence_csv', reason: 'The first column does not look like URLs. Provide a URL list for “existence.csv”.' });
+  const sel = Array.isArray(selected) ? selected : [];
+  const hasInput = !!(shape && shape.exists);
+  const roles = (shape && Array.isArray(shape.inferredRoles)) ? shape.inferredRoles : [];
+
+  // Always-allowed (urls/site_catalog/internal_links/tree) need no checks
+
+  // existence_csv requires input with URL-ish first column (>=60% URL-ish)
+  if (sel.includes('existence_csv')) {
+    if (!hasInput) {
+      errors.push({ key: 'existence_csv', reason: 'No input file found for existence check.' });
+    } else if (!roles.includes('url') && !(shape.firstColUrlShare >= 0.6)) {
+      errors.push({ key: 'existence_csv', reason: 'First column must look like URLs (>=60%).' });
     }
   }
 
-  if (selected.includes('existence_csv') && !shape.exists) {
-    errors.push({ key: 'existence_csv', reason: 'No input file found. Provide a CSV or uncheck this output.' });
+  // comparison_csv requires input AND at least title or description detected
+  if (sel.includes('comparison_csv')) {
+    if (!hasInput) {
+      errors.push({ key: 'comparison_csv', reason: 'Comparison requires an input file.' });
+    } else if (!roles.includes('title') && !roles.includes('description')) {
+      errors.push({ key: 'comparison_csv', reason: 'Need a title and/or description column detected.' });
+    }
   }
-  if (selected.includes('comparison_csv') && !comparisonEnabledByShape(shape)) {
-    errors.push({ key: 'comparison_csv', reason: 'Input CSV must have exactly 2 columns (e.g., Title/Description or URL/Text).' });
+
+  // If no input at all, proactively forbid those two even if selected
+  if (!hasInput) {
+    if (sel.includes('existence_csv')) errors.push({ key: 'existence_csv', reason: 'Forbidden when no input file is provided.' });
+    if (sel.includes('comparison_csv')) errors.push({ key: 'comparison_csv', reason: 'Forbidden when no input file is provided.' });
   }
+
   return errors;
 }
+
 
 function setLaunchContext(ctx) {
   LAUNCH = { ...LAUNCH, ...ctx };
@@ -361,7 +437,14 @@ function handleHttp(req, res) {
         cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
       } catch {}
 
-     const shape = sniffCsvShape(LAUNCH.inputPath);
+     // Prefer the last applied config's meta.inputPath if present, else fall back to LAUNCH
+      const cfgForPre = readConfigFile() || {};
+      const safeInputPath =
+        (cfgForPre.meta && typeof cfgForPre.meta.inputPath === 'string' && cfgForPre.meta.inputPath.trim()) ||
+        (typeof LAUNCH.inputPath === 'string' && LAUNCH.inputPath.trim()) ||
+        '';
+      const shape = sniffCsvShape(safeInputPath);
+
      const file = readConfigFile();
      const selected = (file && Array.isArray(file.outputs)) ? file.outputs : [];
      const meta = (file && file.meta) ? file.meta : {
@@ -375,11 +458,20 @@ function handleHttp(req, res) {
      override: false,
       multiShards: false
     };
-     return sendJson(res, 200, { shape, outputs: OUTPUTS, selected, meta, applied: APPLIED===true, started: STARTED===true });
+    const startedFlag = (file && typeof file.started === 'boolean') ? file.started : (STARTED === true);
+    shape.inferredRoles = shape.inferredRoles || [];
+
+     return sendJson(res, 200, {
+      shape,
+      options: OUTPUTS,
+      selected,
+      outputs: selected,
+      meta,
+      applied: APPLIED === true,
+      started: startedFlag
+    });
+
    }
-
-
-
 
 // POST /config (Apply ONLY — no start here)
 if (req.method === 'POST' && req.url === '/config') {
@@ -393,57 +485,75 @@ if (req.method === 'POST' && req.url === '/config') {
       const outDir = String(meta.outDir || LAUNCH.outDir || 'dist').trim();
 
       const errors = [];
+
+      const ensureHttpUrl = (u) => {
+        const s = String(u || '').trim();
+        if (!s) return '';
+        return /^[a-z]+:\/\//i.test(s) ? s : `https://${s}`;
+      };
+      const normPrefix = (p) => {
+        const s = String(p || '').trim();
+        if (!s) return '/';
+        const withSlash = s.startsWith('/') ? s : `/${s}`;
+        return withSlash.length > 1 ? withSlash.replace(/\/+$/, '') : '/';
+      };
+      const toInt = (n) => Number(n || 0) || 0;
+
+      // validate base
+      const normBase = ensureHttpUrl(meta.base);
+      if (!normBase) errors.push({ key: 'base', reason: 'Base URL is required (e.g., https://stage.example.com).' });
+
       // outDir must exist
       try {
-        const stat = fs.statSync(outDir);
-        if (!stat.isDirectory()) errors.push({ key: 'outDir', reason: 'Not a folder.' });
+        const st = fs.statSync(outDir);
+        if (!st.isDirectory()) errors.push({ key: 'outDir', reason: 'Not a folder.' });
       } catch {
         errors.push({ key: 'outDir', reason: 'Folder does not exist.' });
       }
 
-      // optional: sniff CSV shape if input present to gate certain outputs
-      const needExistence = outputs.includes('existence_csv') || outputs.includes('comparison_csv');
-      if (needExistence && !LAUNCH.inputPath && !meta.inputPath) {
-        errors.push({ key: 'input', reason: 'URL-based outputs selected but no input file was provided.' });
-      }
-
-      // (If you have a real sniffCsvShape/validateOutputs, call them here and push reasons into errors)
+      // CSV gating for URL-based outputs
+      const shape = sniffCsvShape(meta.inputPath || LAUNCH.inputPath);
+      errors.push(...validateOutputs(outputs, shape));
 
       const valid = errors.length === 0;
-
       APPLIED = valid;
-      if (!valid) {
-        return sendJson(res, 200, { valid: false, errors });
-      }
+      if (!valid) return sendJson(res, 200, { valid:false, errors });
 
       // persist config.json
+      LAUNCH.outDir = outDir; // keep UI + server in sync
+      STARTED = false;
       const dir = path.join(outDir, 'telemetry');
       fs.mkdirSync(dir, { recursive: true });
-      const cfg = { 
+
+      const cfg = {
         valid: true,
-        started: false,
-        outputs, 
+        started: false,             // never auto-start on apply
+        outputs,
         meta: {
-        base: String(meta.base || ''),
-        prefix: String(meta.prefix || ''),
-        outDir: outDir,
-        keepPageParam: !!meta.keepPageParam,
-        headless: !!meta.headless,
-        prod: !!meta.prod,
-        maxShards: !!meta.maxShards,
-        multi: !!meta.multiShards,
-        shards: Number(meta.shards || 0) || 0,
-        bucketParts: Number(meta.bucketParts || 0) || 0,
-        inputPath: String(meta.inputPath || LAUNCH.inputPath || '')
-      }};
+          base: normBase,
+          prefix: normPrefix(meta.prefix),
+          outDir,
+          keepPageParam: !!meta.keepPageParam,
+          headless: !!meta.headless,
+          prod: !!meta.prod,
+          maxShards: !!meta.maxShards,
+          multi: !!meta.multiShards,
+          shards: toInt(meta.shards),
+          bucketParts: toInt(meta.bucketParts),
+          inputPath: String(meta.inputPath || LAUNCH.inputPath || '')
+        }
+      };
+
       fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(cfg, null, 2), 'utf8');
-      return sendJson(res, 200, { valid: true, errors: [], meta: cfg.meta });
+      sendJson(res, 200, { valid:true, errors:[], meta: cfg.meta });
     } catch (e) {
-      sendJson(res, 500, { valid: false, errors: [{ key: 'exception', reason: String(e && e.message || e) }] });
+      sendJson(res, 500, { valid:false, errors:[{ key:'exception', reason:String(e && e.message || e) }] });
     }
   });
   return;
 }
+
+
 
 
   // POST /start (separate Start button in Control Panel)
@@ -460,9 +570,8 @@ if (req.method === 'POST' && req.url === '/config') {
       fs.mkdirSync(path.dirname(CONFIG_FILE()), { recursive: true });
       fs.writeFileSync(CONFIG_FILE(), JSON.stringify(file));
 
-      STARTED = true;
-      // Start the run timer NOW (not at server boot)
-      STATE.startedAt = Date.now();
+      STOP_REQUESTED = false; // clear any prior stop request
+      markStart();
       return sendJson(res, 200, { ok:true });
     }
     return sendJson(res, 400, { ok:false, reason:'No valid config applied yet' });
@@ -512,12 +621,15 @@ if (req.method === 'POST' && req.url === '/config') {
   // --- Reset / New Run ---
   if (req.method === 'POST' && req.url === '/reset') {
     STATE.startedAt = Date.now();
+    try { markStart(); } catch {}
     STATE.mode = 'init';
     STATE.stepper.currentIndex = 0;
     STATE.threads = {};
     STATE.buckets = {};
     STATE.tree = {};
     STATE.events = [];
+    APPLIED = false;
+    STARTED = false;
     try { fs.unlinkSync(CONFIG_FILE()); } catch {}
     try {
       const stopFile = path.join((LAUNCH.outDir || 'dist'), 'telemetry', 'stop.flag');
@@ -538,15 +650,19 @@ if (req.method === 'POST' && req.url === '/config') {
       fs.mkdirSync(path.dirname(stopFile), { recursive: true });
       fs.writeFileSync(stopFile, String(Date.now()));
 
-      // Also flip config.started to false so orchestrator won't auto-restart
+      // Flip in-process flag so orchestrator sees it immediately
+      STOP_REQUESTED = true;
+
+      // Also mark config.started=false so nothing auto-restarts
       const cfg = readConfigFile() || { valid:false, outputs:[], meta:{}, started:false };
       cfg.started = false;
       fs.mkdirSync(path.dirname(CONFIG_FILE()), { recursive: true });
       fs.writeFileSync(CONFIG_FILE(), JSON.stringify(cfg));
     } catch {}
-    // Don't reset telemetry here; only a manual "New Run" should reset state
+    // Do not wipe caches or telemetry; manual "New Run" does that
     res.writeHead(204); res.end(); return;
   }
+
 
 
   if (req.method === 'GET' && req.url === '/stop-state') {
@@ -639,20 +755,20 @@ const PAGE_HTML = `<!doctype html>
     <div class="cp-grid">
       <div class="cp-col">
         <label class="cp-k" for="cp-base">Base URL</label>
-        <input id="cp-base" type="text" value="https://stage.ping.com" />
+        <input id="cp-base" type="text" />
         <div class="cp-help">e.g., https://stage.ping.com</div>
       </div>
 
       <div class="cp-col">
         <label class="cp-k" for="cp-prefix">Path Prefix</label>
-        <input id="cp-prefix" type="text" value="/en-us" />
+        <input id="cp-prefix" type="text" />
         <div class="cp-help">Scope the crawl to this path. Keep as <span class="mono">/</span> to crawl all.</div>
       </div>
 
       <div class="cp-col">
         <label class="cp-k">Keep the ?page= query in links</label>
         <div class="cp-row">
-          <input id="cp-keeppage" type="checkbox" checked />
+          <input id="cp-keeppage" type="checkbox" />
           <span class="cp-help">Don’t strip <span class="mono">?page=</span> from URLs.</span>
         </div>
       </div>
@@ -704,7 +820,7 @@ const PAGE_HTML = `<!doctype html>
       <div class="cp-col">
         <label class="cp-k" for="cp-outdir">Output folder (local)</label>
         <div class="cp-row">
-          <input id="cp-outdir" type="text" value="./dist" />
+          <input id="cp-outdir" type="text"/>
           <button class="btn secondary" id="cp-browse">Choose folder…</button>
           <input id="cp-dirpicker" type="file" style="display:none" webkitdirectory directory />
         </div>
@@ -817,30 +933,11 @@ const PAGE_HTML = `<!doctype html>
   </div>
 
 <script>
+  try { localStorage.removeItem('mc_ctrl'); } catch {}
   const $ = (id) => document.getElementById(id);
 
   // Electron detection + folder dialog hookup
   const isElectron = !!(window.electronAPI);
-
-  $('cp-browse').addEventListener('click', async () => {
-    if (isElectron && window.electronAPI && window.electronAPI.selectFolder) {
-      const res = await window.electronAPI.selectFolder();
-      if (!res || res.canceled) return;
-      $('cp-outdir').value = res.path;
-    } else {
-      // Fallback to hidden directory input if not in Electron
-      const picker = $('cp-dirpicker');
-      if (picker) picker.click();
-    }
-  });
-
-  $('cp-dirpicker')?.addEventListener('change', function(){
-    const f = this.files && this.files[0];
-    if (!f) return;
-    const root = f.webkitRelativePath ? (f.webkitRelativePath.split('/')[0] || 'dist') : 'dist';
-    $('cp-outdir').value = (f.path && f.path.trim()) ? f.path : ('./' + root);
-  });
-
 
   // Global meta the UI uses to build full links
   let __mc_meta = { base: '', prefix: '' };
@@ -856,18 +953,6 @@ const PAGE_HTML = `<!doctype html>
       shardsSel.appendChild(opt);
     }
     shardsSel.value = '1';
-
-    // Restore saved settings
-    const saved = JSON.parse(localStorage.getItem('mc_ctrl') || '{}');
-    if (saved.base) $('cp-base').value = saved.base;
-    if (saved.prefix) $('cp-prefix').value = saved.prefix;
-    if (typeof saved.keepPageParam === 'boolean') $('cp-keeppage').checked = saved.keepPageParam;
-    if (typeof saved.headless === 'boolean') $('cp-headless').checked = saved.headless;
-    if (typeof saved.multi === 'boolean') $('cp-multi').checked = saved.multi;
-    if (saved.shards) shardsSel.value = String(saved.shards);
-    if (saved.outDir) $('cp-outdir').value = saved.outDir;
-    if (typeof saved.override === 'boolean') $('cp-override').checked = saved.override;
-    if (saved.fileName) $('cp-file-name').textContent = 'Selected: ' + saved.fileName;
 
     function state(){
       const multi = $('cp-multi').checked;
@@ -943,8 +1028,6 @@ const PAGE_HTML = `<!doctype html>
 
       // If auto, reflect computed shards in the dropdown (cap 32 just for UI)
       if (s.maxShards) $('cp-shards').value = String(Math.min(32, Math.max(1, s.shards)));
-
-
 
       const envPrefix = s.headless ? 'set PLAYWRIGHT_HEADLESS=1 && ' : '';
       const parts = ['node','scripts/shard-run.js'];
@@ -1375,7 +1458,7 @@ function openBrowser(url) {
 
 function logEvent(type, payload) {
   try {
-    STATE.events.push({ t: Date.now(), type, ...payload });
+    STATE.events.push({ t: Date.now(), type, payload });
     if (STATE.events.length > 1000) STATE.events.splice(0, STATE.events.length - 1000);
   } catch {}
 }
@@ -1392,13 +1475,20 @@ const API = {
   setStep: step,
   threadStatus,
   workerUpdate: (...a) => threadStatus(
-    typeof a[0] === 'number' ? { workerId: a[0], ...(a[1]||{}) } : (a[0]||{})
+    typeof a[0] === 'number' ? { workerId: a[0], ...(a[1] || {}) } : (a[0] || {})
   ),
   bucketOwner,
   bucketProgress,
   treeAdd,
   snapshot,
 };
+
+
+API.waitForApplyAndStart = waitForApplyAndStart;
+API.markApplied = markApplied;
+API.markStart = markStart;
+API.requestStop = requestStop;
+API.stopRequested = stopRequested;
 
 
 function remote() {
@@ -1425,5 +1515,66 @@ function remote() {
   };
 }
 
-module.exports = { ...API, telemetry: API, remote };
+// —— Telemetry run-state (single-session init; no auto resets) ——
+let STOP_REQUESTED = false;
+
+// Ensure we only create the session file once per app session
+function sessionFile(){
+  const dir = path.join(LAUNCH.outDir || 'dist', 'telemetry');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'session.json');
+}
+function ensureSessionOnce(){
+  const f = sessionFile();
+  if (!fs.existsSync(f)) {
+    fs.writeFileSync(f, JSON.stringify({ initialized:true, startedRuns:0 }, null, 2));
+    // NOTE: If you ever want "cold-start" cleanups, put them here.
+  }
+}
+
+// These three flags already exist at the top of the file; keep using them.
+function markApplied(){ APPLIED = true; }
+function markStart(){
+  STARTED = true; STOP_REQUESTED = false;
+  // start wall-clock timer for UI
+  try { STATE.startedAt = Date.now(); } catch {}
+  const f = sessionFile();
+  const s = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f,'utf8')) : { initialized:true, startedRuns:0 };
+  s.startedRuns = (s.startedRuns||0)+1;
+  fs.writeFileSync(f, JSON.stringify(s,null,2));
+}
+function requestStop(){ STOP_REQUESTED = true; }
+function stopRequested(){ return !!STOP_REQUESTED; }
+
+/**
+ * Wait until the user has pressed “Apply and start” in the telemetry UI.
+ * This polls the persisted telemetry/config.json that your UI writes:
+ *   { valid:true, started:true, ... }
+ */
+async function waitForApplyAndStart(){
+  while (true) {
+    try {
+      const cfg = readConfigFile();
+      if (cfg && cfg.valid === true && cfg.started === true && cfg.meta && cfg.meta.base) {
+        return;
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 200));
+  }
+}
+
+
+// Export a single, stable surface
+module.exports = {
+  ...API,                // startServer/stop/event/bump/... etc
+  telemetry: API,        // legacy alias
+  remote,                // child->parent http poster
+  setLaunchContext,      // lets shard-run tell us input/outDir early
+  markApplied,
+  markStart,
+  requestStop,
+  stopRequested,
+  waitForApplyAndStart
+};
+
 module.exports.setLaunchContext = setLaunchContext;

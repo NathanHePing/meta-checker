@@ -123,6 +123,26 @@ function bucketFiles(frontierDir, r){
   };
 }
 
+// Bytes left in a single bucket (non-negative)
+function bucketPendingBytes(frontierDir, r){
+  const { file, offset } = bucketFiles(frontierDir, r);
+  try {
+    const size = fs.existsSync(file) ? fs.statSync(file).size : 0;
+    const pos  = fs.existsSync(offset) ? parseInt(readFileWithRetry(offset, 'utf8').trim() || '0', 10) || 0 : 0;
+    return Math.max(0, size - pos);
+  } catch { return 0; }
+}
+
+// Snapshot of all buckets' pending bytes
+function allBucketPending(frontierDir, parts){
+  const list = [];
+  for (let r = 0; r < parts; r++){
+    list.push({ r, pending: bucketPendingBytes(frontierDir, r) });
+  }
+  return list;
+}
+
+
 // ----- Per-bucket owner lock: only one worker scans a bucket at a time -----
 function acquireBucketOwner(frontierDir, r, ownerTag = '') {
   const assignDir = path.join(frontierDir, 'assign');
@@ -222,6 +242,31 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
   return null;
 }
 
+/**
+ * Try current bucket first, then steal from other buckets that have the most pending bytes.
+ * startR is the worker's "home" bucket index. Returns same shape as claimNextBucket().
+ */
+function claimNextAnyBucket(frontierDir, locksDir, startR, parts, acceptFn){
+  // 1) Try home bucket
+  const first = claimNextBucket(frontierDir, locksDir, startR, parts, acceptFn);
+  if (first) return first;
+
+  // 2) Build a sorted donor list by pending bytes (desc), excluding startR
+  const pend = allBucketPending(frontierDir, parts)
+    .filter(x => x.r !== startR && x.pending > 0)
+    .sort((a,b) => b.pending - a.pending);
+
+  for (const { r } of pend) {
+    const got = claimNextBucket(frontierDir, locksDir, r, parts, acceptFn);
+    if (got) {
+      tEmit('bucketOwner', { bucket: r, owner: `steal->${startR}` });
+      return got;
+    }
+  }
+  return null;
+}
+
+
 module.exports = {
   // legacy
   seedFrontier,
@@ -233,5 +278,11 @@ module.exports = {
   seedBuckets,
   appendToBuckets,
   claimNextBucket,
+  claimNextAnyBucket,
   acquireBucketOwner,
+
+  // stats
+  bucketPendingBytes,
+  allBucketPending,
 };
+

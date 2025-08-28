@@ -12,8 +12,11 @@ function fmtMs(ms){ const s = Math.floor(ms/1000); const h= (s/3600)|0; const m=
 function clip(s, n){ s = String(s||''); return s.length>n ? s.slice(0,n-1)+'…' : s; }
 
 async function draw(){
-  readline.cursorTo(process.stdout, 0, 0);
-  readline.clearScreenDown(process.stdout);
+  if (process.stdout.isTTY) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+  }
+
 
   let state = null;
   try { state = JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch {}
@@ -37,24 +40,51 @@ async function draw(){
   console.log(`== Meta-checker Viz ==   mode: ${(state && state.mode) || ''}   elapsed: ${dur}`);
 
   console.log(`Step ${cur+1}/${steps.length}: ${steps.map((s,i)=> i===cur ? `[${s}]` : s).join(' > ')}`);
+  const stepName = steps[cur] || '';
+  const help = STEP_HELP[stepName] || '';
+  if (help) console.log('→ ' + help);
   console.log('');
-  const urlsFound      = (state.totals && state.totals.urlsFound)   || 0;
+
+  const urlsFound      = (state.totals && state.totals.urlsFound)     || 0;
   const internalLinks  = (state.totals && state.totals.internalEdges) || 0;
-  console.log(`Summary: urls=${urlsFound}  internalLinks=${internalLinks}`);
+  const threadCount    = Object.values(state.threads || {}).filter(t => {
+    const hasId = (t.info && (t.info.workerId != null || t.info.pid != null)) || t.pid != null;
+    const phase = t.phase || (t.info && t.info.phase) || '';
+    return hasId && phase !== 'input-confirm';
+  }).length;
+  const bucketCount    = Object.keys(state.buckets || {}).filter(k => k && k !== 'undefined' && k !== 'NaN').length;
 
+  console.log(`Summary: urls=${urlsFound}  internalLinks=${internalLinks}  threads=${threadCount}  buckets=${bucketCount}`);
   console.log('');
 
-  // Workers
-  const wid = Object.keys(state.threads || {}).sort((a,b)=> (+a)-(+b));
+
+  // Flatten and filter threads to what's actually “live”
+  const threads = Object.entries(state.threads || {})
+    .map(([id, w]) => ({ id, ...w }))
+    .filter(w => {
+      const hasId = (w.info && (w.info.workerId != null || w.info.pid != null)) || w.pid != null;
+      const phase = w.phase || (w.info && w.info.phase) || '';
+      return hasId && phase !== 'input-confirm';
+    })
+    .sort((a, b) => (+(a.info?.workerId ?? a.id) - +(b.info?.workerId ?? b.id)));
+
   console.log('Workers:');
-  console.log(' id  pid      stage        bucket  sw/idle   url');
-  for (const id of wid){
-    const w = (state.threads || {})[id] || {};
+  console.log(' id  pid      phase        bucket  sw/idle   url');
+
+  for (const w of threads){
+    const id     = (w.info?.workerId != null) ? String(w.info.workerId) : String(w.id);
+    const pid    = String(w.info?.pid ?? w.pid ?? '');
+    const phase  = String(w.phase || w.info?.phase || '');
+    const bucket = (w.info && (w.info.bucket ?? w.bucket)) ?? '-';
+    const swIdle = String(((w.switches||0)) + '/' + ((w.idle||0)));
+    const url    = String(w.url || w.info?.url || '');
+
     console.log(
-      `${String(id).padStart(2)}  ${String(w.pid||'').padEnd(8)}  ${clip(w.stage,12).padEnd(12)}  ${String(w.bucket??'-').toString().padStart(6)}  ` +
-      `${String((w.switches||0)+'/'+(w.idle||0)).padEnd(7)}  ${clip(w.url, 80)}`
+      `${id.padStart(2)}  ${pid.padEnd(8)}  ${clip(phase,12).padEnd(12)}  ${String(bucket).padStart(6)}  ` +
+      `${swIdle.padEnd(7)}  ${clip(url, 80)}`
     );
   }
+
   console.log('');
 
   // Buckets

@@ -2,6 +2,8 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { sniffCsvShape } = require('../lib/shape-sniff');
+const { validateOutputs } = require('../lib/output-gating');
 
 function getArg(name, def) {
   const idx = process.argv.findIndex(a => a === `--${name}`);

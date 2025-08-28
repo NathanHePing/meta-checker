@@ -30,3 +30,4 @@ meta-check.config.json
 
 #input/output files
 .csv
+.txt

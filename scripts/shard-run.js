@@ -19,9 +19,6 @@ if (typeof global.fetch !== 'function') {
   global.fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 }
 
-const tmod = require('../src/utils/telemetry');
-const telemetry = tmod.telemetry || tmod;
-
 // ----------------------- argv -----------------------
 const argv = minimist(process.argv.slice(2), {
   boolean: ['keepPageParam','dropCache','rebuildLinks','open','headless','override'],
@@ -43,9 +40,26 @@ const inputPath = argv.input ? path.resolve(String(argv.input)) : '';
 const outDirAbs = path.resolve(String(argv.outDir || 'dist'));
 const cfgPath = path.join(outDirAbs, 'telemetry', 'config.json');
 
+try {
+  const j = JSON.parse(fs.readFileSync(cfgPath,'utf8'));
+  if (j && typeof j === 'object') {
+    j.started = false;                       // force fresh preflight
+    fs.mkdirSync(path.dirname(cfgPath), { recursive:true });
+    fs.writeFileSync(cfgPath, JSON.stringify(j, null, 2));
+  }
+} catch {}
+
+
+
+// Telemetry module (load BEFORE using it anywhere)
+const tmod = require('../src/utils/telemetry');
+const telemetry = tmod.telemetry || tmod;
+
+console.log('[orchestrator] waiting for output selection in the web UI…');
+
 // Let telemetry know what we’re launching with (for /preflight CSV sniffing)
-if (typeof tmod.setLaunchContext === 'function') {
-  tmod.setLaunchContext({ inputPath, outDir: outDirAbs });
+if (typeof telemetry.setLaunchContext === 'function') {
+  telemetry.setLaunchContext({ inputPath, outDir: outDirAbs });
 }
 
 function mergeManifestDedup(masterFile, outDir) {
@@ -72,7 +86,7 @@ process.env.TELEMETRY_PORT = String(TELEMETRY_PORT);
 // Optional: spawn Electron shell around the telemetry UI (robust on Windows/mac/Linux)
 if (argv['spawn-electron']) {
   try {
-    const electronPath = require('electron'); // resolves to the electron binary (e.g. electron.cmd on Windows)
+    const electronPath = require('electron');
     const mainJs = path.resolve(__dirname, '../electron/main.js');
 
     const child = spawn(
@@ -95,7 +109,8 @@ if (argv['spawn-electron']) {
       const url = `http://127.0.0.1:${TELEMETRY_PORT}/`;
       require('child_process').spawn(
         process.platform === 'win32' ? 'cmd' : 'xdg-open',
-        process.platform === 'win32' ? ['/c', 'start', '', url] : [url],
+        process.platform === 'win32' ? ['/c', 'start', '', url] :
+        (process.platform === 'darwin' ? [url] : [url]),
         { stdio: 'ignore', detached: true }
       );
       console.log('[orchestrator] opened telemetry in default browser as a fallback');
@@ -123,6 +138,19 @@ async function stopRequested() {
 }
 
 console.log('[orchestrator] waiting for output selection in the web UI…');
+
+// —— START GATE ————————————————————————————————————————————————
+// Do not seed/spawn until the UI has explicitly Applied & Started
+await telemetry.waitForApplyAndStart();
+console.log('[orchestrator] Apply & Start received — proceeding…');
+if (await stopRequested()) {
+   console.log('[orchestrator] stop requested — exiting before configuring');
+   return;
+ }
+// —— END START GATE ————————————————————————————————————————————————
+
+
+
 while (true) {
   if (await stopRequested()) {
     console.log('[orchestrator] stop requested — exiting before start');
@@ -136,6 +164,7 @@ while (true) {
       if (j.started === true) {
         process.env.META_ONLY_REPORTS = j.outputs.join(',');
         const m = j.meta || {};
+        var __preflightShape = j.shape || null;
 
         if (m.base) argv.base = m.base;
         if (m.prefix != null) argv.pathPrefix = m.prefix;
@@ -187,7 +216,7 @@ if (argv.prod === true || String(argv.prod) === 'true') {
   //  - add a global polite delay for frontier claims (used by frontier.js)
   cfg.shards = 1;                 // prod = single shard
   argv.concurrency = 1;           // and single-page concurrency
-  process.env.MC_POLITE_DELAY_MS = process.env.MC_POLITE_DELAY_MS || '400';
+  process.env.MC_POLITE_DELAY_MS = process.env.MC_POLITE_DELAY_MS || '750';
   process.env.MC_USER_AGENT = process.env.MC_USER_AGENT || 'MetaChecker/1.0 (safe mode; contact=you@example.com)';
   bucketParts = 1;                // one bucket
   // also force page-level concurrency 1 in children below
@@ -273,6 +302,7 @@ telemetry.step(0);
 if (!cfg.base) { console.error('✖ Missing required flag: --base'); process.exit(1); }
 fs.mkdirSync(cfg.outDir, { recursive: true });
 
+
 const origin   = new URL(cfg.base).origin;
 const prefix   = String(cfg.pathPrefix || '').replace(/^["']|["']$/g, '').replace(/\/+$/, '');
 const followup = String(argv.followup || 'none').toLowerCase();
@@ -304,7 +334,12 @@ const sniff = parseFirstColumn((argv.input && String(argv.input)) || inputPath |
   } catch {}
 
 
-const sitemapMode = sniff.explicit && sniff.urls.length > 0;
+const sitemapMode =
+  !!(__preflightShape &&
+     __preflightShape.exists === true &&
+     __preflightShape.cols === 3 &&
+     Array.isArray(__preflightShape.inferredRoles) &&
+     __preflightShape.inferredRoles[0] === 'url');
 telemetry.event({
   type: 'mode',
   sitemapMode,
@@ -524,8 +559,15 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   const seedUrl0 = new URL((String(cfg.pathPrefix||'').replace(/^["']|["']$/g,'') || '/'), cfg.base).toString();
   seedBuckets(frontierDir, [seedUrl0], bucketParts);
 
+  function safeURL(u) {
+    let s = String(u || '').trim();
+    if (!s) throw new Error('Base URL is empty');
+    if (!/^[a-z]+:\/\//i.test(s)) s = 'https://' + s;
+    return new URL(s);
+  }
+
   // --- 1) seed-scan to discover first-level sections ---
-  const baseHost = new URL(cfg.base).hostname;
+  const baseHost= safeURL(meta.base);
   const etld1 = (host) => host.split('.').slice(-2).join('.'); // good enough for ping.com
   const sameSite = (u) => etld1(u.hostname) === etld1(baseHost);
 
@@ -545,6 +587,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
 
   telemetry.step('seed-scan');
+  try { telemetry.threadStatus({ pid: process.pid, phase: 'seed-scan', url: seedUrl }); } catch {}
   console.log(`[orchestrator] seed-scan ${seedUrl} to find first-level sections…`);
   const browser = await chromium.launch({
     headless: process.env.PLAYWRIGHT_HEADLESS === '1',
@@ -678,7 +721,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   const sectionUrls = sections.map(s => new URL(`${prefix}/${s}`.replace(/\/+/g,'/'), cfg.base).toString());
   const bootstrapSeeds = Array.from(new Set([seedUrl, ...rootUrls, ...sectionUrls, ...filtered]));
   if (bootstrapSeeds.length) {
-    appendToBuckets(frontierDir, bootstrapSeeds);
+    appendToBuckets(frontierDir, bootstrapSeeds, bucketParts);
     // Announce bucket ownership/initial progress so the Buckets panel isn't empty
     try {
       const files = fs.readdirSync(frontierDir).filter(f => /^bucket\.\d+\.ndjson$/i.test(f));
