@@ -68,6 +68,43 @@ const requestedPort = Number(argv.telemetryPort || process.env.TELEMETRY_PORT ||
 const TELEMETRY_PORT = telemetry.startServer({ port: requestedPort, autoOpen: !!argv.open }) || requestedPort;
 process.env.TELEMETRY_PORT = String(TELEMETRY_PORT);
 
+// Optional: spawn Electron shell around the telemetry UI
+// Optional: spawn Electron shell around the telemetry UI (robust on Windows/mac/Linux)
+if (argv['spawn-electron']) {
+  try {
+    const electronPath = require('electron'); // resolves to the electron binary (e.g. electron.cmd on Windows)
+    const mainJs = path.resolve(__dirname, '../electron/main.js');
+
+    const child = spawn(
+      electronPath,
+      [mainJs, '--telemetry-port', String(TELEMETRY_PORT)],
+      {
+        stdio: 'ignore',              // no inherited console
+        detached: false,              // detached on Win with ignored stdio can cause EINVAL
+        env: { ...process.env, TELEMETRY_PORT: String(TELEMETRY_PORT) }
+      }
+    );
+
+    // unref only if available; harmless otherwise
+    if (typeof child.unref === 'function') child.unref();
+    console.log('[orchestrator] launched Electron UI');
+  } catch (e) {
+    console.error('[orchestrator] failed to launch Electron UI:', e && e.message ? e.message : e);
+    // Fallback: open in default browser so you can keep working
+    try {
+      const url = `http://127.0.0.1:${TELEMETRY_PORT}/`;
+      require('child_process').spawn(
+        process.platform === 'win32' ? 'cmd' : 'xdg-open',
+        process.platform === 'win32' ? ['/c', 'start', '', url] : [url],
+        { stdio: 'ignore', detached: true }
+      );
+      console.log('[orchestrator] opened telemetry in default browser as a fallback');
+    } catch {}
+  }
+}
+
+
+
   function readConfigFile() {
     try { return JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { return null; }
   }
@@ -240,32 +277,32 @@ const origin   = new URL(cfg.base).origin;
 const prefix   = String(cfg.pathPrefix || '').replace(/^["']|["']$/g, '').replace(/\/+$/, '');
 const followup = String(argv.followup || 'none').toLowerCase();
 
-const sniff = parseFirstColumn(inputPath);
-try {
-    if (inputPath) {
-      // Read the first non-empty line for human verification in the UI
+const sniff = parseFirstColumn((argv.input && String(argv.input)) || inputPath || '');
+  try {
+    const inputActual = (argv.input && String(argv.input)) || inputPath || '';
+    if (inputActual) {
       let firstLine = '';
-      if (firstLine) {
-        telemetry.threadStatus({ workerId: 0, phase: 'input-confirm', status: 'ok', firstLine });
-      }
-
       try {
-        const raw = fs.readFileSync(inputPath, 'utf8');
+        const raw = fs.readFileSync(inputActual, 'utf8');
         firstLine = (raw.split(/\r?\n/).find(l => l.trim().length) || '').slice(0, 400);
       } catch {}
+
       const previewUrl = (sniff.urls && sniff.urls[0]) ? sniff.urls[0] : '';
 
       telemetry.threadStatus({
+        workerId: 0,
         phase: 'input-confirm',
-        url: previewUrl ? `First URL: ${previewUrl}` : `Input: ${path.basename(inputPath)}`
+        status: 'ok',
+        url: previewUrl ? `First URL: ${previewUrl}` : `Input: ${path.basename(inputActual)}`,
+        firstLine
       });
 
-      // Also send a dedicated event payload for a tiny panel
-      telemetry.event({ type: 'input/preview', file: path.basename(inputPath), firstLine });
+      telemetry.event({ type: 'input/preview', file: path.basename(inputActual), firstLine });
     } else {
-      telemetry.threadStatus({ phase: 'input-confirm', url: 'No input file selected (discovery-only)' });
+      telemetry.threadStatus({ workerId: 0, phase: 'input-confirm', url: 'No input file selected (discovery-only)' });
     }
   } catch {}
+
 
 const sitemapMode = sniff.explicit && sniff.urls.length > 0;
 telemetry.event({
@@ -735,13 +772,6 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
     console.log('[orchestrator] spawn', t.kind, t.section ? t.section : '', childArgs.slice(1).join(' '));
     telemetry.threadStatus({ workerId: t.workerId, phase: `spawn:${t.kind}`, url: t.section || '' });
-    // If this task will read a specific bucket range, mark ownership (best effort)
-    if (telemetry.bucketOwner && t.argv.includes('--partIndex') && t.argv.includes('--bucketParts')) {
-      const partIdx = Number(t.argv[t.argv.indexOf('--partIndex') + 1] || 0);
-      const parts   = Number(t.argv[t.argv.indexOf('--partTotal') + 1] || 1);
-      // naive: label a "range" owner; real per-bucket claims should happen in workers
-      telemetry.bucketOwner(`${partIdx+1}/${parts}`, `W${t.workerId}`);
-    }
 
 
     const child = fork(childArgs[0], childArgs.slice(1), {
@@ -873,5 +903,9 @@ async function waitForResetThenPreflight() {
     } catch {}
     await sleep(600);
   }
+  try {
+    const stopFile = path.join(argv.outDir || 'dist', 'telemetry', 'stop.flag');
+    if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile);
+  } catch {}
   await waitForPreflightReady();
 }

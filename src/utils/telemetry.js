@@ -8,9 +8,9 @@ const fs   = require('fs');
 const path = require('path');
 
 // === Pre-flight selection state & validators =================================
-let LAUNCH = { inputPath: '', outDir: 'dist' };  // set by shard-run via setLaunchContext()
 let APPLIED = false;
 let STARTED = false;
+let LAUNCH = { inputPath: '', outDir: 'dist' };  // set by shard-run via setLaunchContext()
 const CONFIG_FILE = () => path.join(LAUNCH.outDir || 'dist', 'telemetry', 'config.json');
 
 const OUTPUTS = [
@@ -247,10 +247,9 @@ function threadHeartbeat(info = {}) {
 function bucketUpdate(r, data = {}) {
   if (r == null) return;
   const key = String(r);
-  if (key === '' || key === 'undefined') return;
-  const k = String(r);
-  const prev = STATE.buckets[k] || {};
-  STATE.buckets[k] = { ...prev, ...data };
+  if (!key || key === 'undefined' || key === 'NaN') return;
+  const prev = STATE.buckets[key] || {};
+  STATE.buckets[key] = { ...prev, ...data };
 }
 
 function treeAdd(pathSegs) {
@@ -354,6 +353,14 @@ function handleHttp(req, res) {
 
 // GET /preflight — report current shape + selection + flags
    if (req.method === 'GET' && req.url === '/preflight') {
+
+    // load current config.json if it exists (for meta + selected outputs)
+      let cfg = {};
+      try {
+        const p = path.join((LAUNCH.outDir || 'dist'), 'telemetry', 'config.json');
+        cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+      } catch {}
+
      const shape = sniffCsvShape(LAUNCH.inputPath);
      const file = readConfigFile();
      const selected = (file && Array.isArray(file.outputs)) ? file.outputs : [];
@@ -368,14 +375,7 @@ function handleHttp(req, res) {
      override: false,
       multiShards: false
     };
-     return sendJson(res, 200, {
-       shape,
-      outputs: OUTPUTS,
-       selected,
-       meta,
-       applied: APPLIED === true,
-       started: STARTED === true
-     });
+     return sendJson(res, 200, { shape, outputs: OUTPUTS, selected, meta, applied: APPLIED===true, started: STARTED===true });
    }
 
 
@@ -383,44 +383,68 @@ function handleHttp(req, res) {
 
 // POST /config (Apply ONLY — no start here)
 if (req.method === 'POST' && req.url === '/config') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
+  let body = '';
+  req.on('data', c => body += c);
+  req.on('end', () => {
+    try {
+      const j = JSON.parse(body || '{}');
+      const outputs = Array.isArray(j.outputs) ? j.outputs : [];
+      const meta = j.meta || {};
+      const outDir = String(meta.outDir || LAUNCH.outDir || 'dist').trim();
+
+      const errors = [];
+      // outDir must exist
       try {
-          const j = JSON.parse(body || '{}');
-          const outputs = Array.isArray(j.outputs) ? j.outputs : [];
-          // META from Control Panel (all optional; defaults applied in shard-run)
-          const metaIn = j.meta || {};
-          const meta = {
-            base: typeof metaIn.base === 'string' ? metaIn.base : '',
-            prefix: typeof metaIn.prefix === 'string' ? metaIn.prefix : '',
-            outDir: typeof metaIn.outDir === 'string' ? metaIn.outDir : (LAUNCH.outDir || 'dist'),
-            keepPageParam: !!metaIn.keepPageParam,
-            headless: !!metaIn.headless,
-            shards: Number(metaIn.shards || 0) || 0,
-            bucketParts: Number(metaIn.bucketParts || 0) || 0,
-            override: !!metaIn.override,
-            multiShards: !!metaIn.multiShards,
-            inputPath: typeof metaIn.inputPath === 'string' ? metaIn.inputPath : (LAUNCH.inputPath || '')
-          };
-
-        const errors = [];
-        const ok = outputs.length > 0;
-        if (!ok) errors.push({ key:'outputs', reason:'Select at least one output.' });
-
-        // Always persist started:false here; /start flips to true later
-        const cfgObj = { valid: ok, errors, outputs, meta, started: false };
-        fs.mkdirSync(path.dirname(CONFIG_FILE()), { recursive: true });
-        fs.writeFileSync(CONFIG_FILE(), JSON.stringify(cfgObj));
-
-        if (ok) { APPLIED = true; STARTED = false; }
-        return sendJson(res, 200, cfgObj);
-      } catch (e) {
-        return sendJson(res, 400, { valid:false, errors:[{ key:'json', reason:String(e?.message || e) }] });
+        const stat = fs.statSync(outDir);
+        if (!stat.isDirectory()) errors.push({ key: 'outDir', reason: 'Not a folder.' });
+      } catch {
+        errors.push({ key: 'outDir', reason: 'Folder does not exist.' });
       }
-    });
-    return;
-  }
+
+      // optional: sniff CSV shape if input present to gate certain outputs
+      const needExistence = outputs.includes('existence_csv') || outputs.includes('comparison_csv');
+      if (needExistence && !LAUNCH.inputPath && !meta.inputPath) {
+        errors.push({ key: 'input', reason: 'URL-based outputs selected but no input file was provided.' });
+      }
+
+      // (If you have a real sniffCsvShape/validateOutputs, call them here and push reasons into errors)
+
+      const valid = errors.length === 0;
+
+      APPLIED = valid;
+      if (!valid) {
+        return sendJson(res, 200, { valid: false, errors });
+      }
+
+      // persist config.json
+      const dir = path.join(outDir, 'telemetry');
+      fs.mkdirSync(dir, { recursive: true });
+      const cfg = { 
+        valid: true,
+        started: false,
+        outputs, 
+        meta: {
+        base: String(meta.base || ''),
+        prefix: String(meta.prefix || ''),
+        outDir: outDir,
+        keepPageParam: !!meta.keepPageParam,
+        headless: !!meta.headless,
+        prod: !!meta.prod,
+        maxShards: !!meta.maxShards,
+        multi: !!meta.multiShards,
+        shards: Number(meta.shards || 0) || 0,
+        bucketParts: Number(meta.bucketParts || 0) || 0,
+        inputPath: String(meta.inputPath || LAUNCH.inputPath || '')
+      }};
+      fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(cfg, null, 2), 'utf8');
+      return sendJson(res, 200, { valid: true, errors: [], meta: cfg.meta });
+    } catch (e) {
+      sendJson(res, 500, { valid: false, errors: [{ key: 'exception', reason: String(e && e.message || e) }] });
+    }
+  });
+  return;
+}
+
 
   // POST /start (separate Start button in Control Panel)
   if (req.method === 'POST' && req.url === '/start') {
@@ -795,6 +819,29 @@ const PAGE_HTML = `<!doctype html>
 <script>
   const $ = (id) => document.getElementById(id);
 
+  // Electron detection + folder dialog hookup
+  const isElectron = !!(window.electronAPI);
+
+  $('cp-browse').addEventListener('click', async () => {
+    if (isElectron && window.electronAPI && window.electronAPI.selectFolder) {
+      const res = await window.electronAPI.selectFolder();
+      if (!res || res.canceled) return;
+      $('cp-outdir').value = res.path;
+    } else {
+      // Fallback to hidden directory input if not in Electron
+      const picker = $('cp-dirpicker');
+      if (picker) picker.click();
+    }
+  });
+
+  $('cp-dirpicker')?.addEventListener('change', function(){
+    const f = this.files && this.files[0];
+    if (!f) return;
+    const root = f.webkitRelativePath ? (f.webkitRelativePath.split('/')[0] || 'dist') : 'dist';
+    $('cp-outdir').value = (f.path && f.path.trim()) ? f.path : ('./' + root);
+  });
+
+
   // Global meta the UI uses to build full links
   let __mc_meta = { base: '', prefix: '' };
 
@@ -859,10 +906,37 @@ const PAGE_HTML = `<!doctype html>
     function save(){ localStorage.setItem('mc_ctrl', JSON.stringify(state())); }
 
     function recompute(){
-      const s = state();
+    const s = state();
+
+    // Toggle visibility of shard picker when multi is on
+    $('cp-shard-col').style.display = $('cp-multi').checked ? '' : 'none';
+
+    // Mutual exclusivity: safe mode disables multi
+    $('cp-prod').onchange = () => {
+      if ($('cp-prod').checked) {
+        $('cp-multi').checked = false;
+        $('cp-shard-col').style.display = 'none';
+      }
+      recompute();
+    };
+    $('cp-multi').onchange = () => {
+      if ($('cp-multi').checked) {
+        $('cp-prod').checked = false;
+      }
+      $('cp-shard-col').style.display = $('cp-multi').checked ? '' : 'none';
+      recompute();
+    };
+
+    // Buckets auto = 2 × shards when multi is on and shards > 1
+    const hw = (navigator.hardwareConcurrency || 1);
+    const shards = Math.max(1, parseInt(($('cp-shards').value || '1'), 10));
+    const buckets = ($('cp-multi').checked && shards > 1) ? (2 * shards) : 1;
+    $('cp-buckets').textContent = String(buckets);
+
+      if (s.meta && (s.meta.base || s.meta.prefix)) {
+        __mc_meta = { base: s.meta.base || '', prefix: s.meta.prefix || '' };
+      }
       $('cp-shard-col').style.display = s.multi ? '' : 'none';
-      const bucketKeys = Object.keys(s.buckets || {}).filter(k => k && k !== 'undefined');
-      $('m-buckets').textContent = String(bucketKeys.length);
 
       // Show/Hide “Max shards (auto)” checkbox with multi only
       $('cp-maxshards').closest('.cp-col').style.display = s.multi ? '' : 'none';
@@ -870,21 +944,6 @@ const PAGE_HTML = `<!doctype html>
       // If auto, reflect computed shards in the dropdown (cap 32 just for UI)
       if (s.maxShards) $('cp-shards').value = String(Math.min(32, Math.max(1, s.shards)));
 
-      $('cp-prod').addEventListener('change', () => {
-        if ($('cp-prod').checked) {
-          $('cp-multi').checked = false; // enforce mutual exclusivity
-        }
-        recompute();
-      });
-
-      $('cp-multi').addEventListener('change', () => {
-        if ($('cp-multi').checked) {
-          $('cp-prod').checked = false; // enforce mutual exclusivity
-        } else {
-          $('cp-maxshards').checked = false;
-        }
-        recompute();
-      });
 
 
       const envPrefix = s.headless ? 'set PLAYWRIGHT_HEADLESS=1 && ' : '';
@@ -950,16 +1009,26 @@ const PAGE_HTML = `<!doctype html>
       }
     });
 
-    // EXPLICIT REPLACE for the cp-dirpicker change handler:
-    $('cp-browse').addEventListener('click', () => $('cp-dirpicker').click());
+    // Primary: Electron native folder dialog
+    $('cp-browse').addEventListener('click', async () => {
+      if (isElectron) {
+        const res = await window.electronAPI.selectFolder();
+        if (!res || res.canceled) return;
+        $('cp-outdir').value = res.path;
+        return;
+      }
+      // Fallback: web directory input
+      $('cp-dirpicker').click();
+    });
+
     $('cp-dirpicker').addEventListener('change', function(){
       const f = this.files && this.files[0];
       if (f && f.webkitRelativePath) {
         const root = f.webkitRelativePath.split('/')[0] || 'dist';
-        $('cp-outdir').value = './' + root;         // always set to chosen folder
+        $('cp-outdir').value = (f.path && f.path.trim()) ? f.path : ('./' + root);
       }
-      recompute();
     });
+
 
     $('cp-newrun').addEventListener('click', async function(){
       try { await fetch('/reset-wait'); } catch {}
@@ -975,6 +1044,14 @@ const PAGE_HTML = `<!doctype html>
       }
     });
 
+    $('cp-prod').addEventListener('change', () => {
+      if ($('cp-prod').checked) $('cp-multi').checked = false;
+      recompute();
+    });
+    $('cp-multi').addEventListener('change', () => {
+      if ($('cp-multi').checked) $('cp-prod').checked = false;
+      recompute();
+    });
 
     recompute();
   })();
@@ -1011,6 +1088,9 @@ const PAGE_HTML = `<!doctype html>
       const res = await fetch('/snapshot', { cache: 'no-store' });
       if (!res.ok) return;
       const s = await res.json();
+      if (s.meta && (s.meta.base || s.meta.prefix)) {
+        __mc_meta = { base: s.meta.base || '', prefix: s.meta.prefix || '' };
+      }
 
       $('mode').textContent = s.mode || '';
       $('elapsed').textContent = 'elapsed ' + (s.upTime || '0:00');
@@ -1022,7 +1102,9 @@ const PAGE_HTML = `<!doctype html>
         t && t.info && (t.info.workerId != null || t.info.pid != null) && t.phase !== 'input-confirm'
       );
       $('m-threads').textContent = String(liveThreads.length);
-      $('m-buckets').textContent = String(Object.keys(s.buckets || {}).length);
+      const bucketKeys = Object.keys(s.buckets || {}).filter(k => k && k !== 'undefined' && k !== 'NaN');
+      $('m-buckets').textContent = String(bucketKeys.length);
+
 
       const stepper = $('stepper'); stepper.innerHTML = '';
       const steps = (s.stepper && s.stepper.steps) || [];
@@ -1042,26 +1124,29 @@ const PAGE_HTML = `<!doctype html>
       }
 
       // New Run button inside Files panel
-      $('btn-newrun')?.addEventListener('click', async () => {
-        try { await fetch('/reset', { method: 'POST' }); } catch {}
-        $('files-panel').style.display = 'none';
-        $('preflight').style.display = '';
-      });
+      if (!$('btn-newrun').__bound) {
+        $('btn-newrun').addEventListener('click', async () => {
+          try { await fetch('/reset', { method: 'POST' }); } catch {}
+          $('files-panel').style.display = 'none';
+          $('preflight').style.display = '';
+        });
+        $('btn-newrun').__bound = true;
+      }
 
       // Threads table
       const tb = $('threadsBody'); tb.innerHTML = '';
-      threadList
-        .sort((a,b) => (a.workerId||a.pid||0) - (b.workerId||b.pid||0))
-        .forEach(t => {
-          const tr = document.createElement('tr');
-          const id = t.workerId != null ? ('W' + t.workerId) : String(t.pid || '');
-          tr.innerHTML =
-            '<td>' + id + '</td>' +
-            '<td>' + (t.phase || '') + '</td>' +
-            '<td class="url" title="' + (t.url || '') + '">' + (t.url || '') + '</td>' +
-            '<td>' + String(t.idleSwaps || 0) + (t.idleLimit ? ('/' + t.idleLimit) : '') + '</td>';
-          tb.appendChild(tr);
-        });
+        liveThreads
+          .sort((a,b) => (a.workerId||a.pid||0) - (b.workerId||b.pid||0))
+          .forEach(t => {
+            const tr = document.createElement('tr');
+            const id = t.workerId != null ? ('W' + t.workerId) : String(t.pid || '');
+            tr.innerHTML =
+              '<td>' + id + '</td>' +
+              '<td>' + (t.phase || '') + '</td>' +
+              '<td class="url" title="' + (t.url || '') + '">' + (t.url || '') + '</td>' +
+              '<td>' + String(t.idleSwaps || 0) + (t.idleLimit ? ('/' + t.idleLimit) : '') + '</td>';
+            tb.appendChild(tr);
+          });
 
       // Buckets grid
       const bk = $('buckets'); bk.innerHTML = '';
@@ -1103,24 +1188,31 @@ const PAGE_HTML = `<!doctype html>
       grid.style.gridTemplateColumns = 'repeat(' + (maxDepth + 1) + ', minmax(220px, 1fr))';
       grid.style.gap = '8px 14px';
 
-      function pillLink(label, depth) {
+      function pillLink(seg, fullPath) {
         const a = document.createElement('a');
-        a.className = 'node depth-' + depth;
-        a.textContent = label || '/';
-        const base = (__mc_meta && __mc_meta.base) ? __mc_meta.base : '';
+        a.className = 'node';
+        a.textContent = seg || '/';
+        const base = (__mc_meta && __mc_meta.base) || '';
+        let href = fullPath.startsWith('/') ? fullPath : '/' + fullPath;
         try {
-          const full = base ? new URL(label || '/', base).toString() : (label || '/');
-          a.href = full;
-        } catch { a.href = label || '/'; }
+          href = new URL(href, base).toString();
+        } catch {}
+        a.href = href;
         a.target = '_blank';
-        a.rel = 'noopener noreferrer';
-        a.title = a.href;
+        a.rel = 'noopener';
+
+        if (isElectron && window.electronAPI && window.electronAPI.openExternal) {
+          a.addEventListener('click', (e) => {
+            e.preventDefault();
+            window.electronAPI.openExternal(href);
+          });
+        }
         return a;
       }
 
-      function emitRow(depth, label) {
+      function emitRow(depth, fullPath) {
         for (let c = 0; c <= maxDepth; c++) {
-          grid.appendChild(c === depth ? pillLink(label, depth) : document.createElement('div'));
+          grid.appendChild(c === depth ? pillLink(fullPath.split('/').pop(), fullPath) : document.createElement('div'));
         }
       }
 
@@ -1151,7 +1243,7 @@ const PAGE_HTML = `<!doctype html>
       const r = await fetch('/preflight');
       const j = await r.json();
       __mc_meta = j.meta || { base: '', prefix: '' };
-      const selected = new Set(j.selected || []);
+      const selected = new Set(j.outputs || []);
       for (const el of form.querySelectorAll('input[name="outputs"]')) {
         if (selected.size) el.checked = selected.has(el.value);
       }

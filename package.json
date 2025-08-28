@@ -10,6 +10,9 @@
   "scripts": {
     "start": "node scripts/shard-run.js",
     "dev": "node scripts/shard-run.js --open true",
+    "dev:headless": "node scripts/shard-run.js --open false",
+    "dev:app": "cross-env OPEN_TELEMETRY=false node scripts/shard-run.js --open false --spawn-electron",
+    "electron": "electron electron/main.js",
     "postinstall": "playwright install chromium",
     "build:exe": "cross-env PLAYWRIGHT_BROWSERS_PATH=0 pkg . --targets node18-win-x64,node18-macos-x64,node18-linux-x64 --output dist/MetaChecker",
     "build:exe:win": "cross-env PLAYWRIGHT_BROWSERS_PATH=0 pkg . --targets node18-win-x64 --output dist/MetaChecker.exe",
@@ -22,8 +25,9 @@
     "playwright": "^1.46.0"
   },
   "devDependencies": {
-    "pkg": "^5.8.1",
-    "cross-env": "^7.0.3"
+    "cross-env": "^7.0.3",
+    "electron": "^30.0.0",
+    "pkg": "^5.8.1"
   },
   "pkg": {
     "scripts": [
@@ -31,7 +35,8 @@
       "src/**/*.js"
     ],
     "assets": [
-      "README.md"
+      "README.md",
+      "electron/**/*.js"
     ],
     "targets": [
       "node18-win-x64",
