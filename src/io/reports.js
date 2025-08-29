@@ -27,6 +27,17 @@ function writeCsv(file, headers, rows, opts = {}) {
 
 const withinLimit = (s, max) => (s || '').length <= max;
 
+/**
+ * writeReports(cfg, pages, rows)
+ * - pages: [{url,title,description,titleN,links:[{url,text,kind}]}]
+ * - rows: input rows normalized upstream to:
+ *     { expectedTitle, expectedDesc, expectedUrl? }
+ * - cfg.existenceRows (optional): [{
+ *     input_url, exists: 'true'|'false', http_status, final_url
+ *   }]
+ * - cfg.onlyReports (optional): ['comparison_csv','internal_links',...]
+ * - cfg.excelDelimiter (optional): 'comma'|'tab'
+ */
 async function writeReports(cfg, pages, rows) {
   const only = Array.isArray(cfg.onlyReports) && cfg.onlyReports.length ? new Set(cfg.onlyReports) : null;
   const allow = (k) => (!only || only.has(k));
@@ -36,7 +47,7 @@ async function writeReports(cfg, pages, rows) {
   const out = (f) => path.join(cfg.outDir, f);
   const csvOpts = { delimiter: cfg.excelDelimiter, includeBom: true };
 
-  // Debug catalog dump
+  // Debug catalog dump (unchanged)
   if (needCompare) {
     const pagesCsv = [...pages].sort((a,b)=> a.url.localeCompare(b.url));
     fs.writeFileSync(out('titles-debug.csv'),
@@ -45,7 +56,7 @@ async function writeReports(cfg, pages, rows) {
     );
   }
 
-  // Duplicate titles
+  // Duplicate titles (always emit CSV + TXT)
   const titleMap = new Map();
   for (const p of pages) {
     if (!titleMap.has(p.titleN)) titleMap.set(p.titleN, []);
@@ -55,10 +66,22 @@ async function writeReports(cfg, pages, rows) {
   for (const [t, list] of titleMap.entries()) {
     if (list.length > 1) duplicateRows.push({ title_normalized: t, url_count: list.length, urls: list.join(' | ') });
   }
+  try {
+    writeCsv(out('duplicate-titles.csv'), ['title_normalized','url_count','urls'], duplicateRows, csvOpts);
+  } catch {}
+  try {
+    let idx = 0;
+    const blocks = duplicateRows.map(r => [
+      `[DUPLICATE TITLE #${++idx}] "${r.title_normalized}" appears on:`,
+      ...String(r.urls || '').split(' | ').map(u => ` - ${u}`),
+      'Action: Deduplicate titles or match by explicit URL.',
+      '---'
+    ].join('\n'));
+    fs.writeFileSync(out('duplicate-titles.txt'), blocks.length ? blocks.join('\n') + '\n' : 'No duplicate titles.\n', 'utf8');
+  } catch {}
 
-  // Internal links JSON + CSV
+  // Internal links JSON + CSV (behind internal_links)
   const linksMap = pages.map(p => ({ url: p.url, links: Array.isArray(p.links) ? p.links : [] }));
-
   const internalLinkRows = [];
   for (const p of linksMap) {
     for (const l of p.links) {
@@ -73,7 +96,6 @@ async function writeReports(cfg, pages, rows) {
       });
     }
   }
-
   if (needLinks) {
     writeCsv(out('internal-links.csv'), ['page_url','link_url','link_path','label','kind'], internalLinkRows, csvOpts);
     fs.writeFileSync(out('internal-links.json'), JSON.stringify(linksMap, null, 2), 'utf8');
@@ -95,7 +117,6 @@ async function writeReports(cfg, pages, rows) {
 
   // Matching & classification
   const pageByUrl = new Map(pages.map(p => [p.url, p]));
-
   const correctRows = [];
   const mismatchDescOnlyRows = [];
   const mismatchOtherRows = [];
@@ -152,8 +173,8 @@ async function writeReports(cfg, pages, rows) {
       });
 
       if (titleMatch && descMatch &&
-        expectedTitleLenOK && expectedDescLenOK &&
-        foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
+          expectedTitleLenOK && expectedDescLenOK &&
+          foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
         correctRows.push(base);
       } else if (titleMatch && !descMatch) {
         mismatchDescOnlyRows.push(base);
@@ -163,9 +184,7 @@ async function writeReports(cfg, pages, rows) {
       continue;
     }
 
-    // title based
-    // ── ANCHOR: comparison_match_title_or_desc ────────────────────────────────
-    // Prefer title-based matching when present; otherwise fall back to description.
+    // Prefer title-based; fallback to description-based fuzzy matching
     let match;
     if (wantTitle) {
       match = findByPrefixThenSimilarity(
@@ -174,11 +193,10 @@ async function writeReports(cfg, pages, rows) {
         { prefixWords: cfg.prefixWords, fuzzyThreshold: cfg.fuzzyThreshold }
       );
     } else if (wantDesc) {
-      // Reuse the matcher by projecting descriptions into the "titleN" slot.
       const descCorpus = pages.map(p => ({
         url: p.url,
         titleN: normalizeText(p.description || ''),
-     }));
+      }));
       match = findByPrefixThenSimilarity(
         descCorpus,
         expectedDescN,
@@ -188,7 +206,7 @@ async function writeReports(cfg, pages, rows) {
       notFoundRows.push({ type: 'empty', expected_url: '', expected_title: '', expected_desc: '', note: 'Row has neither title nor description' });
       continue;
     }
-    // ── /ANCHOR: comparison_match_title_or_desc ───────────────────────────────
+
     if (match.type === 'none') {
       notFoundRows.push({ type: 'title', expected_url: '', expected_title: expectedTitleN, expected_desc: expectedDescN, note: 'No page matched this title (even with prefix/fuzzy)' });
       continue;
@@ -212,8 +230,8 @@ async function writeReports(cfg, pages, rows) {
     });
 
     if (titleMatch && descMatch &&
-          expectedTitleLenOK && expectedDescLenOK &&
-          foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
+        expectedTitleLenOK && expectedDescLenOK &&
+        foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
       correctRows.push(base);
     } else if (titleMatch && !descMatch) {
       mismatchDescOnlyRows.push(base);
@@ -222,37 +240,56 @@ async function writeReports(cfg, pages, rows) {
     }
   }
 
-  // CSV outputs → dist
-if (needCompare ) {
-  writeCsv(out('duplicate-titles.csv'),      ['title_normalized','url_count','urls'], duplicateRows, csvOpts);
-  writeCsv(out('extras-not-in-input.csv'),   ['url','title_normalized','description_normalized','title_len','desc_len','mode'], extrasRows, csvOpts);
-  writeCsv(out('not-found.csv'),             ['type','expected_url','expected_title','expected_desc','note'], notFoundRows, csvOpts);
-  writeCsv(out('ambiguous-fuzzy.csv'),       ['match_type','score','expected_title','candidates'], ambiguousRows, csvOpts);
-  writeCsv(out('correct.csv'),               ['url','matched_by','expected_title','found_title','expected_title_len','found_title_len','expected_desc','found_desc','expected_desc_len','found_desc_len','title_len_ok','desc_len_ok'], correctRows, csvOpts);
-  writeCsv(out('mismatches-desc-only.csv'),  ['url','matched_by','expected_title','found_title','expected_title_len','found_title_len','expected_desc','found_desc','expected_desc_len','found_desc_len','title_len_ok','desc_len_ok'], mismatchDescOnlyRows, csvOpts);
-  writeCsv(out('mismatches-other.csv'),      ['url','matched_by','expected_title','found_title','expected_title_len','found_title_len','expected_desc','found_desc','expected_desc_len','found_desc_len','title_len_ok','desc_len_ok','note'], mismatchOtherRows, csvOpts);
-
+  // === CSV outputs → dist (comparison set) ===
+  if (needCompare) {
+    writeCsv(out('extras-not-in-input.csv'),   ['url','title_normalized','description_normalized','title_len','desc_len','mode'], extrasRows, csvOpts);
+    writeCsv(out('not-found.csv'),             ['type','expected_url','expected_title','expected_desc','note'], notFoundRows, csvOpts);
+    writeCsv(out('ambiguous-fuzzy.csv'),       ['match_type','score','expected_title','candidates'], ambiguousRows, csvOpts);
+    writeCsv(out('correct.csv'),               ['url','matched_by','expected_title','found_title','expected_title_len','found_title_len','expected_desc','found_desc','expected_desc_len','found_desc_len','title_len_ok','desc_len_ok'], correctRows, csvOpts);
+    writeCsv(out('mismatches-desc-only.csv'),  ['url','matched_by','expected_title','found_title','expected_title_len','found_title_len','expected_desc','found_desc','expected_desc_len','found_desc_len','title_len_ok','desc_len_ok'], mismatchDescOnlyRows, csvOpts);
+    writeCsv(out('mismatches-other.csv'),      ['url','matched_by','expected_title','found_title','expected_title_len','found_title_len','expected_desc','found_desc','expected_desc_len','found_desc_len','title_len_ok','desc_len_ok','note'], mismatchOtherRows, csvOpts);
   }
 
+  // === Internal links again (guard) ===
   if (needLinks) {
     writeCsv(out('internal-links.csv'), ['page_url','link_url','link_path','label','kind'], internalLinkRows, csvOpts);
     fs.writeFileSync(out('internal-links.json'), JSON.stringify(linksMap, null, 2), 'utf8');
   }
 
+  // === Existence → working / not-working CSVs (NEW) ===
+  // If upstream (run.js) provides cfg.existenceRows, write:
+  //   - working-urls.csv   columns: url,http_status
+  //   - not-working-urls.csv columns: url,http_status
+  if (Array.isArray(cfg.existenceRows) && cfg.existenceRows.length) {
+    const working = [];
+    const broken  = [];
+    for (const r of cfg.existenceRows) {
+      const isOk = String(r.exists).toLowerCase() === 'true';
+      const url  = (r.final_url && r.final_url.trim()) || (r.input_url || '');
+      const row  = { url, http_status: r.http_status };
+      if (isOk && url) working.push(row);
+      else broken.push({ url: r.input_url || '', http_status: r.http_status });
+    }
+    writeCsv(out('working-urls.csv'),     ['url','http_status'], working, csvOpts);
+    writeCsv(out('not-working-urls.csv'), ['url','http_status'], broken,  csvOpts);
+  }
 
   // Summary (only list what we actually wrote)
-  const lines = [
-    '=== SUMMARY ==='
-  ];
+  const lines = ['=== SUMMARY ==='];
 
-  if (needCompare ) {
+  lines.push(`Duplicate titles detected: ${duplicateRows.length}`);
+  lines.push(`duplicate-titles.csv:      ${out('duplicate-titles.csv')}`);
+  if (fs.existsSync(out('duplicate-titles.txt'))) {
+    lines.push(`duplicate-titles.txt:      ${out('duplicate-titles.txt')}`);
+  }
+
+  if (needCompare) {
     lines.push(
       `Correct rows: ${correctRows.length}`,
       `Titles not found: ${notFoundRows.length}`,
       `Ambiguous/fuzzy matches: ${ambiguousRows.length}`,
       `Mismatches (desc only): ${mismatchDescOnlyRows.length}`,
       `Mismatches (other): ${mismatchOtherRows.length}`,
-      `Duplicate titles detected: ${duplicateRows.length}`,
       `Extras (pages on site not in input by ${cfg.extrasMode}): ${extrasRows.length}`,
       '',
       `correct.csv:               ${out('correct.csv')}`,
@@ -260,10 +297,9 @@ if (needCompare ) {
       `mismatches-other.csv:      ${out('mismatches-other.csv')}`,
       `not-found.csv:             ${out('not-found.csv')}`,
       `ambiguous-fuzzy.csv:       ${out('ambiguous-fuzzy.csv')}`,
-      `duplicate-titles.csv:      ${out('duplicate-titles.csv')}`,
-      `extras-not-in-input.csv:   ${out('extras-not-in-input.csv')}`
+      `extras-not-in-input.csv:   ${out('extras-not-in-input.csv')}`,
+      `titles-debug.csv:          ${out('titles-debug.csv')}`
     );
-      lines.push(`titles-debug.csv:          ${out('titles-debug.csv')}`);
   }
 
   if (needLinks) {
@@ -276,13 +312,19 @@ if (needCompare ) {
     }
   }
 
+  if (Array.isArray(cfg.existenceRows) && cfg.existenceRows.length) {
+    lines.push(
+      '',
+      `working-urls.csv:          ${out('working-urls.csv')}`,
+      `not-working-urls.csv:      ${out('not-working-urls.csv')}`
+    );
+  }
+
   lines.push(''); // trailing newline
   fs.writeFileSync(out('summary.txt'), lines.join('\n'), 'utf8');
-
-
 }
 
-// ---- Hierarchical tree report (added) -------------------------------------
+// ---- Hierarchical tree report (unchanged) -------------------------------------
 function __buildTree(allUrls, pathPrefix) {
   const root = { name: pathPrefix || '/', children: new Map(), urls: [] };
   const norm = (u) => {
@@ -345,9 +387,6 @@ function __renderTree(node, prefix = '', isLast = true) {
  *   - <outDir>/tree-examples.md (sample reconstructable URLs per branch)
  */
 function writeTreeReport(outDir, allUrls, pathPrefix) {
-  const fs = require('fs');
-  const path = require('path');
-
   try {
     const tree = __buildTree(allUrls, pathPrefix);
     const ascii = __renderTree(tree, '', true).join('\n');
@@ -371,6 +410,4 @@ function writeTreeReport(outDir, allUrls, pathPrefix) {
 }
 // ---------------------------------------------------------------------------
 
-
 module.exports = { writeReports, writeTreeReport };
-

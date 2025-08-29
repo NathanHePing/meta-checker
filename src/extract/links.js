@@ -121,11 +121,13 @@ async function installNavRecorder(page) {
 
 function filterAndNormalize(items, { origin, pathPrefix, keepPageParam }) {
   const seen = new Set(), out = [];
+  const assetRe = /\.(?:png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|css|js|woff2?|ttf|otf)(?:\?|$)/i;
   for (const it of items) {
     try {
       const u = new URL(it.url, origin);
       if (u.origin !== origin) continue;
       if (pathPrefix && !u.pathname.startsWith(pathPrefix)) continue;
+      if (assetRe.test(u.pathname)) continue;
       if (!keepPageParam) {
         const q = new URLSearchParams(u.search);
         for (const k of Array.from(q.keys())) if (!/^page$/i.test(k)) q.delete(k);
@@ -143,7 +145,15 @@ function filterAndNormalize(items, { origin, pathPrefix, keepPageParam }) {
 }
 
 async function extractInternalLinks(page, opts) {
-  const { origin, pathPrefix = '', keepPageParam = false, max = 50000, interactive = true, waitAfterLoadMs = 300 } = opts || {};
+  const {
+    origin,
+    pathPrefix = '',
+   keepPageParam = false,
+    max = 50000,
+    interactive = true,
+    waitAfterLoadMs = 300,
+    allowSubdomains = false
+  } = opts || {};
   try { await page.setViewportSize({ width: 1920, height: 1600 }); } catch {}
   try { await page.waitForLoadState('networkidle', { timeout: 3000 }); } catch {}
   if (waitAfterLoadMs) await page.waitForTimeout(waitAfterLoadMs);
@@ -159,7 +169,17 @@ async function extractInternalLinks(page, opts) {
   const navs = await page.evaluate(() => Array.from(new Set(window.__navs || [])));
   if (navs.length) items.push(...navs.map(u => ({ url: u, text: '', kind: 'spa' })));
 
-  return filterAndNormalize(items, { origin, pathPrefix, keepPageParam }).slice(0, max);
+  if (!allowSubdomains) {
+    return filterAndNormalize(items, { origin, pathPrefix, keepPageParam }).slice(0, max);
+  } else {
+    const baseHost = new URL(origin).hostname;
+   const etld1 = (h) => h.split('.').slice(-2).join('.');
+    const registrable = etld1(baseHost);
+    const sameSiteItems = items.filter(it => {
+      try { return etld1(new URL(it.url, origin).hostname) === registrable; } catch { return false; }
+    });
+    return filterAndNormalize(sameSiteItems, { origin, pathPrefix, keepPageParam }).slice(0, max);
+  }
 }
 
 module.exports = { extractInternalLinks };

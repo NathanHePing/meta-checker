@@ -122,6 +122,7 @@ async function crawlSite(context, base, opts) {
     pathPrefix     = '/',
     maxPages       = 50000,
     keepPageParam  = false,
+    strictSameHost = false,
 
     // logging
     logger,
@@ -165,9 +166,14 @@ async function crawlSite(context, base, opts) {
   const origin   = baseUrl.origin;
   const baseHost = baseUrl.hostname;
 
-  // crude eTLD+1 (good enough for ping.com)
-  const etld1 = (host) => host.split('.').slice(-2).join('.'); // "stage.ping.com" -> "ping.com"
-  const sameSite = (u) => etld1(u.hostname) === etld1(baseHost);
+  // Site-scope guard: either strict host match, or eTLD+1 fallback
+  const etld1 = (host) => host.split('.').slice(-2).join('.');
+  const sameSite = (u) => {
+    return strictSameHost
+      ? u.hostname === baseHost           // require exact host (stage.ping.com only)
+      : etld1(u.hostname) === etld1(baseHost); // allow any subdomain under ping.com
+  };
+
 
   // normalize query params and trailing slashes
   function normalizeQuery(u) {
@@ -196,7 +202,7 @@ async function crawlSite(context, base, opts) {
         return null;
       }
 
-     if (/\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|avi|mov|woff2?|ttf|otf)(\?|$)/i.test(u)) {
+     if (/\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|avi|mov|css|js|woff2?|ttf|otf)(\?|$)/i.test(u)) {
         dlog('reject:asset', { url: u.toString() });
         return null;
       }

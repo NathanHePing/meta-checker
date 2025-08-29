@@ -1,11 +1,11 @@
 // src/run.js
 'use strict';
 
-const { chromium } = require('playwright');
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-
+const { chromium } = require('playwright');
 const tmod = require('./utils/telemetry');
 const telemetry = tmod.telemetry || tmod;
 // Check the stop flag that the telemetry server writes
@@ -321,16 +321,6 @@ async function run(cfg) {
     roleHint
   });
 
-  // === LOG: mode resolution snapshot ===
-  log.info('mode resolution', {
-    usingUrlsFile,
-    sitemapMode,
-    inputExists,
-    shape,
-    explicitInputUrls: (explicitInputUrls || []).length,
-    roleHint
-  });
-
   if (!usingUrlsFile && sitemapMode) {
   console.log('Explicit URL input detected → using first column as explicit URL list; skipping discovery.', {
     rows: rows?.length ?? 0,
@@ -505,20 +495,24 @@ if (!usingUrlsFile && !sitemapMode) {
     writeFileSync(outCsv, toCsv(['input_url','exists','http_status','final_url'], rows), 'utf8');
     writeFileSync(outJson, JSON.stringify(rows, null, 2), 'utf8');
 
-    // working/not-working master + per-shard lists
-    const workingLines   = rows.filter(r => r.exists === 'true')
-                              .map(r => `${r.final_url || r.input_url},${r.http_status}`);
-    const notWorkingLines= rows.filter(r => r.exists !== 'true')
-                               .map(r => `${r.input_url},${r.http_status}`);
-    if (workingLines.length)
-      writeFileSync(path.join(cfg.outDir, 'working-urls.txt'), workingLines.join('\n') + '\n', 'utf8');
-    if (notWorkingLines.length)
-      writeFileSync(path.join(cfg.outDir, 'not-working-urls.txt'), notWorkingLines.join('\n') + '\n', 'utf8');
-    writeFileSync(path.join(cfg.outDir, `working-urls.part${tag}.txt`),
-      rows.filter(r => r.exists === 'true' && (r.final_url || r.input_url))
-          .map(r => r.final_url || r.input_url).join('\n') + '\n', 'utf8');
-    writeFileSync(path.join(cfg.outDir, `not-working-urls.part${tag}.txt`),
-      rows.filter(r => r.exists !== 'true').map(r => r.input_url).join('\n') + '\n', 'utf8');
+  // working/not-working master + per-shard lists (CSV)
+  const workingRows = rows
+    .filter(r => r.exists === 'true')
+    .map(r => ({ url: r.final_url || r.input_url, http_status: r.http_status }));
+
+  const notWorkingRows = rows
+    .filter(r => r.exists !== 'true')
+    .map(r => ({ url: r.input_url, http_status: r.http_status }));
+
+  if (workingRows.length) {
+    writeCsv(path.join(cfg.outDir, 'working-urls.csv'), ['url','http_status'], workingRows);
+    writeCsv(path.join(cfg.outDir, `working-urls.part${tag}.csv`), ['url','http_status'], workingRows);
+  }
+  if (notWorkingRows.length) {
+    writeCsv(path.join(cfg.outDir, 'not-working-urls.csv'), ['url','http_status'], notWorkingRows);
+    writeCsv(path.join(cfg.outDir, `not-working-urls.part${tag}.csv`), ['url','http_status'], notWorkingRows);
+}
+
 
    // done — skip the heavy fetch/crawl entirely
     try { telemetry.threadStatus({ workerId: cfg.workerId, phase: 'done', url: '' }); } catch {}
@@ -579,12 +573,37 @@ if (!usingUrlsFile && !sitemapMode) {
     locale: 'en-US',
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36'
   });
-  await context.route('**/*', (route) => {
-    const u = route.request().url();
-    if (/\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|avi|mov)(\?|$)/i.test(u)) return route.abort();
-    if (/(googletagmanager|google-analytics|doubleclick|facebook|segment|mixpanel|hotjar)\./i.test(u)) return route.abort();
+  // --- Network policy: block binaries; 204-fulfill analytics; block off-origin subresources ---
+  const isBinary = (u) => /\.(png|jpe?g|gif|webp|svg|ico|bmp|avif|pdf|zip|mp4|webm|avi|mov|m4v|mp3|wav|ogg|woff2?|ttf|otf|eot)(\?|$)/i.test(u);
+  const isAnalytics = (u) => /(googletagmanager|google-analytics|doubleclick|facebook|fbcdn|segment\.io|cdn\.segment|mixpanel|hotjar|clarity\.ms|newrelic|nr-data|datadoghq|snowplow|optimizely|sentry\.io)\./i.test(u);
+  const sameOriginUrl = (u) => { try { return new URL(u).origin === baseOrigin; } catch { return false; } };
+  await context.route('**/*', async (route) => {
+    const req = route.request();
+    const url = req.url();
+    if (isBinary(url)) return route.abort();                     // drop heavy assets
+    if (isAnalytics(url)) return route.fulfill({ status: 204 }); // make beacons "succeed" instantly
+    if (req.resourceType() !== 'document' && !sameOriginUrl(url)) {
+     return route.abort();                                      // no off-origin subresources
+    }
     return route.continue();
   });
+
+  // Optional: quiet expected noise from our intentional blocks
+  try {
+    context.on('requestfailed', (req) => {
+      const u = req.url();
+      if (isBinary(u) || isAnalytics(u) || !sameOriginUrl(u)) return; // ignore our policy blocks
+     log.warn('requestfailed', { url: u, failure: req.failure()?.errorText || '' });
+    });
+    context.on('page', (page) => {
+      page.on('console', (msg) => {
+        if (msg.type() !== 'error') return;
+        const t = msg.text() || '';
+       if (/Failed to load resource/i.test(t) || /net::ERR_FAILED/i.test(t)) return;
+        log.warn('console.error', { text: t });
+      });
+    });
+  } catch {}
 
   // fast HTTP reachability probe (no rendering)
   async function httpProbe(url, timeoutMs = 12000) {
@@ -643,8 +662,17 @@ if (!usingUrlsFile && !sitemapMode) {
       let finalClaim;
       const page = await context.newPage();
       // === LOG: Playwright signal for hard failures ===
-      page.on('requestfailed', req => {
-        try { log.warn('requestfailed', { url: req.url(), failure: req.failure()?.errorText }); } catch {}
+       page.on('requestfailed', req => {
+        try {
+          const url = req.url();
+          // Ignore known analytics/telemetry hosts
+          if (/(googletagmanager|google-analytics|doubleclick|facebook|segment|mixpanel|hotjar)\./i.test(url)) return;
+          // Only care about same-site requests
+          if (!url.startsWith(baseOrigin)) return;
+          // Ignore obvious asset extensions
+          if (/\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|avi|mov|css|js|woff2?|ttf|otf)(\?|$)/i.test(url)) return;
+          log.warn('requestfailed', { url, failure: req.failure()?.errorText });
+        } catch {}
       });
       page.on('response', res => {
         try {
@@ -724,7 +752,8 @@ if (!usingUrlsFile && !sitemapMode) {
         }
 
         // pathPrefix guard after redirects
-        if (cfg.pathPrefix && !new URL(finalKey).pathname.startsWith(cfg.pathPrefix)) {
+        // same-origin + pathPrefix guard after redirects
+        if (cfg.sameOrigin !== false && new URL(finalKey).origin !== baseOrigin) {
           if (sitemapMode) existenceProbe.set(seedKey, { exists: false, status, final_url: finalKey });
           return;
         }
@@ -811,11 +840,17 @@ if (!usingUrlsFile && !sitemapMode) {
     });
   }
 
-  if (comparisonEnabled) {
-    await writeReports({ ...cfg, onlyReports }, out, rowsForReports);
-  } else {
+  // Always run writeReports so duplicate-titles.csv (and internal-links CSV) are emitted.
+  const reporterRows = Array.isArray(rowsForReports) ? rowsForReports : [];
+  const reporterCfg  = comparisonEnabled
+    ? { ...cfg, onlyReports }                                  // full comparison set
+    : { ...cfg, onlyReports: ['internal_links'] };             // no comparison tables, still do internals + duplicates
+
+  await writeReports(reporterCfg, out, reporterRows);
+
+  if (!comparisonEnabled) {
     log.info('comparison skipped for this input mode');
-    // emit lightweight site_catalog when comparison is off
+    // Still emit a lightweight site catalog for convenience
     const cat = out.map(p => ({
       url: p.url,
       title: p.title || '',
@@ -830,6 +865,7 @@ if (!usingUrlsFile && !sitemapMode) {
       log.info('report', { file: `site_catalog.part${tag}.csv`, rows: cat.length });
     }
   }
+
 
   // Also emit a lightweight internal-links file from the extracted links
   try {
@@ -880,18 +916,23 @@ if (!usingUrlsFile && !sitemapMode) {
 
     // also write working/not-working master lists WITH status (url,status)
     try {
-      const workingLines = existenceRows
-        .filter(r => r.exists === 'true')
-        .map(r => `${r.final_url || r.input_url},${r.http_status}`);
-      const brokenLines = existenceRows
-        .filter(r => r.exists !== 'true')
-        .map(r => `${r.input_url},${r.http_status}`);
-      if (workingLines.length)
-        fs.writeFileSync(path.join(cfg.outDir, 'working-urls.txt'), workingLines.join('\n') + '\n', 'utf8');
-      if (brokenLines.length)
-        fs.writeFileSync(path.join(cfg.outDir, 'not-working-urls.txt'), brokenLines.join('\n') + '\n', 'utf8');
-      log.info('report', { file: 'working-urls.txt', count: workingLines.length });
-      log.info('report', { file: 'not-working-urls.txt', count: brokenLines.length });
+      // working/not-working master + per-shard lists (CSV)
+    const workingRows = existenceRows
+      .filter(r => r.exists === 'true')
+      .map(r => ({ url: r.final_url || r.input_url, http_status: r.http_status }));
+
+    const notWorkingRows = existenceRows
+      .filter(r => r.exists !== 'true')
+      .map(r => ({ url: r.input_url, http_status: r.http_status }));
+
+    if (workingRows.length) {
+      writeCsv(path.join(cfg.outDir, 'working-urls.csv'), ['url','http_status'], workingRows);
+      writeCsv(path.join(cfg.outDir, `working-urls.part${tag}.csv`), ['url','http_status'], workingRows);
+    }
+    if (notWorkingRows.length) {
+      writeCsv(path.join(cfg.outDir, 'not-working-urls.csv'), ['url','http_status'], notWorkingRows);
+      writeCsv(path.join(cfg.outDir, `not-working-urls.part${tag}.csv`), ['url','http_status'], notWorkingRows);
+    }
     } catch (e) {
       log.warn('writing working/not-working failed', { err: String(e && e.message ? e.message : e) });
     }
