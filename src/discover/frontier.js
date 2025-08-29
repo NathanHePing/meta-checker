@@ -287,6 +287,7 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
   // Normalize CRLF → LF before slicing to lines
   const tail = buf.toString('utf8', pos).replace(/\r\n/g, '\n');
   const lines = tail.split('\n');
+  let advanced = 0;
   let claimed = false;
 
   for (let i=0; i<lines.length; i++){
@@ -305,7 +306,6 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
       const newPos = pos + advanced;
       try { writeFileWithRetry(offset, String(newPos), 'utf8'); } catch {}
       tEmit('bucketProgress', { bucket: r, cursor: newPos, size: buf.length, claimed: true });
-      claimed = true;
       const delayMs = parseInt(process.env.MC_POLITE_DELAY_MS || '0', 10) || 0;
       if (delayMs > 0) { try { sleepMs(delayMs); } catch {} }
       return { url, ...claim };
@@ -313,8 +313,8 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
   }
 
   // consumed all new lines, advance cursor to EOF
-  try { writeFileWithRetry(offset, String(pos), 'utf8'); } catch {}
-  tEmit('bucketProgress', { bucket: r, cursor: pos, size: buf.length, claimed: false });
+  try { writeFileWithRetry(offset, String(buf.length), 'utf8'); } catch {}
+  tEmit('bucketProgress', { bucket: r, cursor: buf.length, size: buf.length });
   return null;
 }
 
