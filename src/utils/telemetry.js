@@ -572,6 +572,7 @@ if (req.method === 'POST' && req.url === '/config') {
 
       STOP_REQUESTED = false; // clear any prior stop request
       markStart();
+      STATE.startedAt = Date.now();
       return sendJson(res, 200, { ok:true });
     }
     return sendJson(res, 400, { ok:false, reason:'No valid config applied yet' });
@@ -1181,6 +1182,13 @@ const PAGE_HTML = `<!doctype html>
       $('m-urls').textContent = String((s.totals && s.totals.urlsFound) || 0);
       $('m-edges').textContent = String((s.totals && s.totals.internalEdges) || 0);
       const threadList = Object.values(s.threads || {});
+        // Keep last non-empty render to prevent "flicker" during step transitions
+        const hadRows = !!threadsBody.innerHTML && /<tr/.test(threadsBody.innerHTML);
+        if (!threadList.length && hadRows) {
+          // leave previous table alone this tick
+        } else {
+          // (your existing code that rebuilds rows goes here)
+        }
       const liveThreads = (Object.values(s.threads || {})).filter(t =>
         t && t.info && (t.info.workerId != null || t.info.pid != null) && t.phase !== 'input-confirm'
       );

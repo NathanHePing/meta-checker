@@ -44,10 +44,10 @@ const asInt = (v, d) => {
 
   const cfg = {
     // inputs
-    input: argv.input || 'input.csv',
+    input: (argv.input ? argv.input : ''),
     base: argv.base,
     pathPrefix: sanitizePathPrefix(argv.pathPrefix || ''),
-    keepPageParam: !!argv.keepPageParam,
+    keepPageParam: (argv.keepPageParam === true || argv.keepPageParam === 'true'),
     sameOrigin: argv.sameOrigin !== 'false',
     outDir,
     excelDelimiter: (argv.excelDelimiter || 'comma').toLowerCase(), // 'comma' | 'tab'

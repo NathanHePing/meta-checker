@@ -129,8 +129,10 @@ async function writeReports(cfg, pages, rows) {
     const expectedDescN  = normalizeText(row.expectedDesc || '');
     const explicitUrl    = (row.expectedUrl || '').trim();
 
-    const expectedTitleLenOK = withinLimit(expectedTitleN, MAX_TITLE);
-    const expectedDescLenOK  = withinLimit(expectedDescN,  MAX_DESC);
+    const wantTitle = !!expectedTitleN;
+    const wantDesc  = !!expectedDescN;
+    const expectedTitleLenOK = !wantTitle || withinLimit(expectedTitleN, MAX_TITLE);
+    const expectedDescLenOK  = !wantDesc  || withinLimit(expectedDescN,  MAX_DESC);
 
     if (explicitUrl) {
       const p = pageByUrl.get(explicitUrl);
@@ -140,8 +142,8 @@ async function writeReports(cfg, pages, rows) {
       }
       const foundTitleN = p.titleN;
       const foundDescN  = normalizeText(p.description || '');
-      const titleMatch  = expectedTitleN === foundTitleN;
-      const descMatch   = expectedDescN  === foundDescN;
+      const titleMatch  = !wantTitle || (expectedTitleN === foundTitleN);
+      const descMatch   = !wantDesc  || (expectedDescN  === foundDescN);
 
       const base = baseRow({
         url: p.url, matched_by: 'explicit',
@@ -149,7 +151,9 @@ async function writeReports(cfg, pages, rows) {
         expected_desc: expectedDescN,   found_desc: foundDescN
       });
 
-      if (titleMatch && descMatch && expectedTitleLenOK && expectedDescLenOK && foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
+      if (titleMatch && descMatch &&
+        expectedTitleLenOK && expectedDescLenOK &&
+        foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
         correctRows.push(base);
       } else if (titleMatch && !descMatch) {
         mismatchDescOnlyRows.push(base);
@@ -160,7 +164,31 @@ async function writeReports(cfg, pages, rows) {
     }
 
     // title based
-    const match = findByPrefixThenSimilarity(pages, expectedTitleN, { prefixWords: cfg.prefixWords, fuzzyThreshold: cfg.fuzzyThreshold });
+    // ── ANCHOR: comparison_match_title_or_desc ────────────────────────────────
+    // Prefer title-based matching when present; otherwise fall back to description.
+    let match;
+    if (wantTitle) {
+      match = findByPrefixThenSimilarity(
+        pages,
+        expectedTitleN,
+        { prefixWords: cfg.prefixWords, fuzzyThreshold: cfg.fuzzyThreshold }
+      );
+    } else if (wantDesc) {
+      // Reuse the matcher by projecting descriptions into the "titleN" slot.
+      const descCorpus = pages.map(p => ({
+        url: p.url,
+        titleN: normalizeText(p.description || ''),
+     }));
+      match = findByPrefixThenSimilarity(
+        descCorpus,
+        expectedDescN,
+        { prefixWords: cfg.prefixWords, fuzzyThreshold: cfg.fuzzyThreshold }
+      );
+    } else {
+      notFoundRows.push({ type: 'empty', expected_url: '', expected_title: '', expected_desc: '', note: 'Row has neither title nor description' });
+      continue;
+    }
+    // ── /ANCHOR: comparison_match_title_or_desc ───────────────────────────────
     if (match.type === 'none') {
       notFoundRows.push({ type: 'title', expected_url: '', expected_title: expectedTitleN, expected_desc: expectedDescN, note: 'No page matched this title (even with prefix/fuzzy)' });
       continue;
@@ -173,8 +201,8 @@ async function writeReports(cfg, pages, rows) {
     const p = pageByUrl.get(match.items[0].url);
     const foundTitleN = p.titleN;
     const foundDescN  = normalizeText(p.description || '');
-    const titleMatch  = expectedTitleN === foundTitleN;
-    const descMatch   = expectedDescN  === foundDescN;
+    const titleMatch  = !wantTitle || (expectedTitleN === foundTitleN);
+    const descMatch   = !wantDesc  || (expectedDescN  === foundDescN);
     const matchedBy   = match.type + (match.score != null ? `:${match.score.toFixed(3)}` : '');
 
     const base = baseRow({
@@ -183,7 +211,9 @@ async function writeReports(cfg, pages, rows) {
       expected_desc: expectedDescN,   found_desc: foundDescN
     });
 
-    if (titleMatch && descMatch && expectedTitleLenOK && expectedDescLenOK && foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
+    if (titleMatch && descMatch &&
+          expectedTitleLenOK && expectedDescLenOK &&
+          foundTitleN.length <= MAX_TITLE && foundDescN.length <= MAX_DESC) {
       correctRows.push(base);
     } else if (titleMatch && !descMatch) {
       mismatchDescOnlyRows.push(base);
@@ -233,9 +263,7 @@ if (needCompare ) {
       `duplicate-titles.csv:      ${out('duplicate-titles.csv')}`,
       `extras-not-in-input.csv:   ${out('extras-not-in-input.csv')}`
     );
-    if (typeof titlesDebugRows !== 'undefined') {
       lines.push(`titles-debug.csv:          ${out('titles-debug.csv')}`);
-    }
   }
 
   if (needLinks) {

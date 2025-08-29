@@ -193,11 +193,13 @@ while (true) {
 const cfg = {
   base: argv.base,
   pathPrefix: sanitizePathPrefix(argv.pathPrefix || ''),
-  keepPageParam: !!argv.keepPageParam,
+  keepPageParam: (argv.keepPageParam === true || argv.keepPageParam === 'true'),
   shards: Math.min(+argv.shardCap || Infinity, Math.max(1, +argv.shards || os.cpus().length)),
   outDir: path.resolve(String(argv.outDir || 'dist')),
   childEntry: path.resolve('src/index.js'),
+  input: argv.input || 'input.csv',
 };
+
 
 // --- Apply "maxShards" if requested by UI
 if (argv.maxShards === true || String(argv.maxShards) === 'true') {
@@ -207,6 +209,18 @@ if (argv.maxShards === true || String(argv.maxShards) === 'true') {
 // buckets: 2*shards if shards>1, else 1 (unless explicitly provided)
 let bucketParts = Number(argv.bucketParts || 0);
 if (!bucketParts) bucketParts = (cfg.shards > 1 ? (2 * cfg.shards) : 1);
+
+// … later, AFTER you read and apply meta overrides from telemetry/config.json …
+{
+  const _bp = Number(argv.bucketParts);
+  if (_bp && Number.isFinite(_bp) && _bp > 0) {
+    bucketParts = Math.floor(_bp);
+  } else {
+    bucketParts = (cfg.shards > 1 ? (2 * cfg.shards) : 1);
+  }
+}
+
+console.log('[orchestrator] bucketParts (final):', bucketParts);
 
 // --- Prod (safe) mode policy
 if (argv.prod === true || String(argv.prod) === 'true') {
@@ -239,7 +253,7 @@ console.log('[orchestrator] final meta:', {
 
 
 // optional: start the terminal TUI that reads dist/telemetry/state.json
-try {
+if (!process.env.NO_VIZ) try {
   const tui = spawn(process.execPath, [path.resolve(__dirname, 'viz-tui.js'), outDirAbs], {
     stdio: 'inherit',
     env: { ...process.env, TELEMETRY_PORT: String(TELEMETRY_PORT) }
@@ -353,7 +367,6 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
   // Common outputs
   const master = path.join(cfg.outDir, 'urls-final.txt');
-  try { fs.unlinkSync(master); } catch {}
   for (const f of fs.readdirSync(cfg.outDir)) {
     if (/^urls-final\.part\d+\.json$/i.test(f)) {
       try { fs.unlinkSync(path.join(cfg.outDir, f)); } catch {}
@@ -392,10 +405,10 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       const childArgs = [
         cfg.childEntry,
         '--base', cfg.base,
-        '--input', argv.input || 'input.csv', 
         '--concurrency', String(argv.concurrency || 4),
         '--keepPageParam', String(cfg.keepPageParam),
         '--outDir', cfg.outDir,
+        '--input', argv.input || 'input.csv',
         '--rebuildLinks', argv.rebuildLinks ? 'true' : 'false',
         '--dropCache',   argv.dropCache   ? 'true' : 'false',
         '--headless', (process.env.PLAYWRIGHT_HEADLESS ? 'true' : 'false'),
@@ -522,7 +535,6 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
         const out = cfg.outDir;
         const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true }); console.log('[clean]', path.relative(process.cwd(), p)); } catch (e) { console.warn('[clean warn]', e.message); } };
         for (const f of fs.readdirSync(out)) if (/^urls-final\.part\d+\.json$/i.test(f)) rm(path.join(out, f));
-        rm(path.join(out, 'urls-final.txt'));
         rm(path.join(out, 'frontier'));
         rm(path.join(out, 'disco-locks'));
         rm(path.join(out, 'locks'));
@@ -556,8 +568,23 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
   fs.mkdirSync(frontierDir, { recursive: true });
   fs.mkdirSync(discoLocks, { recursive: true });
 
-  const seedUrl0 = new URL((String(cfg.pathPrefix||'').replace(/^["']|["']$/g,'') || '/'), cfg.base).toString();
-  seedBuckets(frontierDir, [seedUrl0], bucketParts);
+  // Canonical seeds (both with/without trailing slash to avoid strict prefix filters)
+  const rawPrefix = String(cfg.pathPrefix || '').replace(/^["']|["']$/g,'') || '/';
+  const normPrefixNoSlash = rawPrefix === '/' ? '/' : rawPrefix.replace(/\/+$/,'');
+  const normPrefixSlash   = normPrefixNoSlash === '/' ? '/' : (normPrefixNoSlash + '/');
+ const seedNoSlash = new URL(normPrefixNoSlash, cfg.base).toString();
+  const seedSlash   = new URL(normPrefixSlash,   cfg.base).toString();
+  // De-duplicate but guarantee we have at least one seed line
+  const canonicalSeeds = Array.from(new Set([seedNoSlash, seedSlash].map(u => u.replace(/#.*$/,''))));
+
+  seedBuckets(frontierDir, canonicalSeeds, bucketParts);
+  // DEBUG: show a safe peek so we can confirm we truly wrote URL lines (not just CRLF)
+  try {
+    const bucket0 = path.join(frontierDir, `bucket.0.ndjson`);
+    const sample  = fs.existsSync(bucket0) ? fs.readFileSync(bucket0,'utf8').split(/\r?\n/).slice(0,3) : [];
+    console.log('[frontier] seed sample bucket.0.ndjson →', sample);
+  } catch {}
+
 
   function safeURL(u) {
     let s = String(u || '').trim();
@@ -635,11 +662,11 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       'button[aria-expanded="false"],button[aria-controls],' +
       '[role="button"][aria-expanded="false"],[data-toggle],[data-action*="menu"],[data-action*="expand"]'
     );
-    for (const btn of menuButtons.slice(0, 8)) await clickSafe(btn);
+    for (const btn of menuButtons.slice(0, 20)) await clickSafe(btn);
     const hoverables = await page.$$(
       'nav [aria-haspopup="true"], nav .dropdown, nav .menu, .nav [aria-expanded]'
     );
-    for (const el of hoverables.slice(0, 16)) await hoverSafe(el);
+    for (const el of hoverables.slice(0, 32)) await hoverSafe(el);
     try { await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); } catch {}
     await page.waitForTimeout(200);
 
@@ -724,9 +751,51 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
     appendToBuckets(frontierDir, bootstrapSeeds, bucketParts);
     // Announce bucket ownership/initial progress so the Buckets panel isn't empty
     try {
-      const files = fs.readdirSync(frontierDir).filter(f => /^bucket\.\d+\.ndjson$/i.test(f));
+      // Accept either "bucket.N.ndjson" or "bucket-N.ndjson"
+      const files = fs.readdirSync(frontierDir).filter(f => /^bucket[.-]\d+\.ndjson$/i.test(f));
+      // NEW: sanity log of per-bucket line counts so we can see if frontier is truly empty
+      const lineCount = (p) => {
+        try { return (fs.readFileSync(p, 'utf8').match(/\n/g) || []).length; } catch { return 0; }
+      };
+      const counts = files
+        .map(f => [f, lineCount(path.join(frontierDir, f))])
+        .sort((a,b) => a[0].localeCompare(b[0]));
+      console.log('[frontier] bucket files:', counts.map(([f,c]) => `${f}:${c}`).join(', '));
+      const totalLines = counts.reduce((n, [,c]) => n + c, 0);
+
+        // Keep the friendly warning
+        if (totalLines === 0) {
+          console.warn('[frontier] WARNING: all buckets are empty after seeding — workers will exit immediately.');
+        }
+
+        // Extra peek: print the very first non-empty line we see in the first bucket
+      try {
+        const first = files.sort()[0];
+        if (first) {
+          const p = path.join(frontierDir, first);
+          const txt = fs.readFileSync(p,'utf8');
+          const firstLine = (txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] || '');
+          if (firstLine) {
+            console.log('[frontier] first line sample:', firstLine);
+          } else {
+            console.warn('[frontier] first line sample is empty (only blank lines present)');
+          }
+        }
+      } catch {}
+
+        // NEW: hard-stop if literally every bucket has 0 lines (avoid “done with no work” confusion)
+        if (counts.every(([, c]) => c === 0)) {
+          console.warn('[frontier] No work after seeding — check base/prefix/bucketParts. Aborting run.');
+          telemetry.event({ type: 'error', msg: 'No work after seeding (0 lines in all buckets).' });
+          telemetry.step('done');
+          try {
+            if (global.__mc_visibleBrowser) { await global.__mc_visibleBrowser.close(); global.__mc_visibleBrowser = null; }
+          } catch {}
+          await waitForResetThenPreflight();
+          return;
+        }
       for (const f of files) {
-        const m = f.match(/bucket\.(\d+)\.ndjson/i);
+      const m = f.match(/bucket[.-](\d+)\.ndjson/i);
         if (!m) continue;
         const r = Number(m[1]);
         // owner "none" at bootstrap, 0 processed/pending unknown (UI will update when workers claim)
@@ -737,6 +806,22 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
 
     telemetry.step('bootstrap-frontier');
     console.log('[orchestrator] bootstrap frontier +', bootstrapSeeds.length, 'seeds');
+    // Sanity: log per-bucket line counts and show a sample line so we know
+  try {
+    const files = fs.readdirSync(frontierDir).filter(f => /^bucket\.\d+\.ndjson$/i.test(f));
+    const lineCount = (p) => {
+      try { return (fs.readFileSync(p, 'utf8').match(/\n/g) || []).length; } catch { return 0; }
+    };
+   const counts = files.map(f => [f, lineCount(path.join(frontierDir, f))]).sort((a,b)=>a[0].localeCompare(b[0]));
+    console.log('[frontier] bucket files:', counts.map(([f,c]) => `${f}:${c}`).join(', '));
+    const first = files.sort()[0];
+    if (first) {
+      const txt = fs.readFileSync(path.join(frontierDir, first), 'utf8');
+      const firstLine = (txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] || '');
+      console.log('[frontier] first line sample:', firstLine || '(empty)');
+    }
+  } catch {}
+
   }
 
 
@@ -754,6 +839,7 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
       '--partIndex', String(i),
       '--partTotal', String(parts),
       '--bucketParts', String(bucketParts),
+      '--bucketPattern', 'dot',
       '--workerId', String(i + 1),
       '--workerTotal', String(parts),
       '--urlsOutFile', path.join(cfg.outDir, `urls-final.part${i+1}.json`),
@@ -879,7 +965,6 @@ console.log(`[orchestrator] ${new Date().toLocaleTimeString()} CPU=${os.cpus().l
           for (const f of fs.readdirSync(out)) {
             if (/^urls-final\.part\d+\.json$/i.test(f)) rm(path.join(out, f));
           }
-          try { fs.unlinkSync(master); } catch {}
 
           rm(path.join(out, 'frontier'));
           rm(path.join(out, 'disco-locks'));

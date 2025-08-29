@@ -17,6 +17,14 @@ const T = {
 const fs   = require('fs');
 const path = require('path');
 
+const DECIDE_SAMPLE = Number(process.env.DECIDE_SAMPLE || 200);
+let __decideCount = 0;
+function dlog(kind, payload) {
+  if (__decideCount++ < DECIDE_SAMPLE) {
+    try { console.log('[decide]', kind, payload); } catch {}
+  }
+}
+
 // --- tiny retry for Windows/OneDrive EBUSY/EPERM during reads ---
 function sleepMs(ms){ const sab = new SharedArrayBuffer(4); Atomics.wait(new Int32Array(sab), 0, 0, ms); }
 function readFileWithRetry(p, enc='utf8', tries=40){
@@ -177,19 +185,26 @@ async function crawlSite(context, base, opts) {
   function acceptAndNormalize(rawUrl, baseForRel) {
     try {
       const u0 = new URL(rawUrl, baseForRel || origin);
-      if (!sameSite(u0)) return null; // only same-site in the crawl frontier
+      if (!sameSite(u0)) { dlog('reject:origin', { url: rawUrl, origin: u0.origin }); return null; }
+      const wantPrefix = String(pathPrefix || '/');
 
       // rewrite to base origin, keep path+search
-      const u = new URL(u0.pathname + u0.search, origin);
+      const u = new URL(u0.pathname.replace(/\/{2,}/g, '/') + u0.search, origin);
+      const pn = u.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/,'') || '/';
+      if (wantPrefix !== '/' && !(pn === wantPrefix || pn.startsWith(wantPrefix + '/'))) {
+        dlog('reject:prefix', { url: u.toString(), pathname: pn, wantPrefix });
+        return null;
+      }
 
-      // scope to prefix
-      if (pathPrefix && !u.pathname.startsWith(pathPrefix)) return null;
-
-      // drop obvious non-HTML assets
-      if (/\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|avi|mov|woff2?|ttf|otf)(\?|$)/i.test(u)) return null;
+     if (/\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|mp4|webm|avi|mov|woff2?|ttf|otf)(\?|$)/i.test(u)) {
+        dlog('reject:asset', { url: u.toString() });
+        return null;
+      }
 
       normalizeQuery(u);
-      return u.toString();
+      const out = u.toString();
+      dlog('accept', { url: out });
+      return out;
     } catch {
       return null;
     }
@@ -299,7 +314,9 @@ async function crawlSite(context, base, opts) {
   }
 
   // trigger client routers without leaving the page
-  async function probeSpa(page, limit = 50000) {
+  const SPA_CLICK_LIMIT = Number(process.env.SPA_CLICK_LIMIT || 300);
+  async function probeSpa(page, limit = SPA_CLICK_LIMIT) {
+    try { console.log('[crawler] probeSpa limit', { limit }); } catch {}
     const clickables = await page.$$('a[href], [role="link"], [data-href], [data-url], [role="menuitem"]');
     for (const el of clickables.slice(0, limit)) {
       try { await el.click({ timeout: 300 }); } catch {}
@@ -369,9 +386,22 @@ async function crawlSite(context, base, opts) {
   if (frontierDir && discoLocks) {
     const B = Number(bucketParts || W);
     log.info(`Frontier crawl (parts=${W}, me=${me}, buckets=${B}) starting…`);
+    // If orchestrator left the frontier empty, self-seed the base+prefix landing.
+    try {
+      const pendParts = pendingBytesAll(frontierDir);
+      const totalPend = pendParts.reduce((s, x) => s + x.pending, 0);
+      if (totalPend === 0) {
+       const seed = new URL(String(pathPrefix || '/').replace(/^\/*/, '/'), origin)
+          .toString()
+          .replace(/\/$/, '');
+        appendToBuckets(frontierDir, [seed], B);
+        log.info('Frontier was empty — self-seeded base+prefix', { seed });
+        try { T.event({ type: 'frontier/self-seed', url: seed }); } catch {}
+      }
+    } catch {}
 
     try {
-    telemetry.event({
+    T.event({
       type: 'frontier/start',
       parts: opts.bucketParts || 1,
       me:    opts.partIndex || 0,
@@ -381,7 +411,6 @@ async function crawlSite(context, base, opts) {
 
 
     const results   = new Set();
-    let idleCycles  = 0;
 
     // preferred buckets for this worker: i, i+W, i+2W, …
     const preferred  = [];
@@ -412,7 +441,7 @@ async function crawlSite(context, base, opts) {
 
           if (!claim) {
             localIdle++;
-            if (localIdle >= 3) break;               // release bucket so others can try it
+            if (localIdle >= LOCAL_IDLE_TICKS) break;
             await new Promise(res => setTimeout(res, 100));
             continue;
           }
@@ -489,7 +518,12 @@ async function crawlSite(context, base, opts) {
     };
 
     // main work/idle loop with global quiescence detection
-    let stableCycles = 0;
+    let stableCycles = 0, idleCycles = 0;
+    // ── ANCHOR: quiescence_thresholds ───────────────────────────────────────────
+    const STABLE_EXIT_TICKS = parseInt(process.env.MC_STABLE_TICKS || '150', 10); // ~30s if tick=200ms
+    const IDLE_EXIT_TICKS   = parseInt(process.env.MC_IDLE_TICKS   || '450', 10); // ~90s
+    const LOCAL_IDLE_TICKS  = parseInt(process.env.MC_LOCAL_IDLE   || '12', 10); // tries per bucket
+    // ── /ANCHOR: quiescence_thresholds ──────────────────────────────────────────
     let lastSnap = '';
 
     while (results.size < maxPages) {
@@ -528,8 +562,7 @@ async function crawlSite(context, base, opts) {
 
       // Be more patient before declaring quiescence.
       if (totalPend === 0 && locksNow === 0) {
-        // ~30s of stable emptiness or ~90s of total idling
-        if (stableCycles >= 150 || idleCycles >= 450) {
+       if (stableCycles >= STABLE_EXIT_TICKS || idleCycles >= IDLE_EXIT_TICKS) {
           log.info('frontier empty — exiting', {
             me, seen: results.size, pendingBytes: totalPend,
             stableCycles, idleCycles
@@ -704,10 +737,13 @@ async function crawlSite(context, base, opts) {
   }
 
   log.info(`Crawl done. Collected ${urls.length} URLs.`);
-  return Array.from(new Set(urls)).filter(u => {
+  const uniq = Array.from(new Set(urls));
+  const out  = uniq.filter(u => {
     try { const uu = new URL(u); return !pathPrefix || uu.pathname.startsWith(pathPrefix); }
     catch { return false; }
-  });
+ });
+  try { console.log('[crawler] totals', { preDedup: urls.length, deduped: uniq.length, postScope: out.length, prefix: pathPrefix || '' }); } catch {}
+  return out;
 }
 
 module.exports = { crawlSite };

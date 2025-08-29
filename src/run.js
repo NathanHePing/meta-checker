@@ -160,7 +160,8 @@ const writeJson = (file, obj) => fs.writeFileSync(file, JSON.stringify(obj, null
 async function run(cfg) {
   const argvModeMatch = process.argv.join(' ').match(/--mode\s+(\S+)/);
   const argvMode = argvModeMatch ? argvModeMatch[1] : '';
-  const forceFrontier = String((cfg && cfg.mode) || argvMode || '').toLowerCase() === 'frontier';
+  const runMode = String((cfg && cfg.mode) || argvMode || '').toLowerCase();
+  const forceFrontier = runMode === 'frontier';
   // sensible defaults for paths used below
   const tag = (cfg.workerId ?? cfg.shardIndex ?? 1);
   const cacheDir = path.join(cfg.outDir || 'dist', 'cache');
@@ -181,7 +182,9 @@ async function run(cfg) {
   fs.mkdirSync(path.dirname(cfg.cachePath), { recursive: true });
 
   const baseOrigin = new URL(cfg.base).origin;
-  const maxCrawlPages = Number.isFinite(cfg.maxCrawlPages) ? cfg.maxCrawlPages : 50000;
+  const maxCrawlPagesRaw = Number.isFinite(cfg.maxCrawlPages) ? Number(cfg.maxCrawlPages) : 50000;
+    // Interpret 0 or negative as "no cap"
+    const maxCrawlPages = (maxCrawlPagesRaw <= 0 ? Number.POSITIVE_INFINITY : maxCrawlPagesRaw);
 
   log.info('start', {
     base: cfg.base,
@@ -225,14 +228,6 @@ async function run(cfg) {
   // If orchestrator passed a urlsFile, use it (highest priority)
   let urls = [];
   const usingUrlsFile = (cfg.urlsFile && fs.existsSync(cfg.urlsFile));
-  try {
-    telemetry.event({
-      type: 'mode',
-      sitemapMode: !!sitemapMode,
-      usingUrlsFile: !!usingUrlsFile,
-      urlCount: Array.isArray(urls) ? urls.length : 0
-    });
-  } catch {}
   if (usingUrlsFile) {
     urls = JSON.parse(fs.readFileSync(cfg.urlsFile, 'utf8'));
     log.info('Loaded shard URLs from file', { file: cfg.urlsFile, count: urls.length });
@@ -300,6 +295,15 @@ async function run(cfg) {
     }
   }
 
+  try {
+    telemetry.event({
+      type: 'mode',
+      sitemapMode: !!sitemapMode,
+      usingUrlsFile: !!usingUrlsFile,
+      urlCount: Array.isArray(urls) ? urls.length : 0
+    });
+  } catch {}
+
   // Inform telemetry about the mode
   try {
     telemetry.setMode(!inputExists ? 'no-input' : sitemapMode ? 'explicit-urls' : 'discovery');
@@ -307,15 +311,34 @@ async function run(cfg) {
     telemetry.event({ type: 'base', base: cfg.base, pathPrefix: cfg.pathPrefix || '/' });
   } catch {}
 
-  // If sitemapMode: normalize the explicit URL list now
-if (!forceFrontier && !usingUrlsFile && sitemapMode) {
+  // === LOG: mode resolution snapshot ===
+  log.info('mode resolution', {
+    usingUrlsFile,
+    sitemapMode,
+    inputExists,
+    shape,
+    explicitInputUrls: (explicitInputUrls || []).length,
+    roleHint
+  });
+
+  // === LOG: mode resolution snapshot ===
+  log.info('mode resolution', {
+    usingUrlsFile,
+    sitemapMode,
+    inputExists,
+    shape,
+    explicitInputUrls: (explicitInputUrls || []).length,
+    roleHint
+  });
+
+  if (!usingUrlsFile && sitemapMode) {
   console.log('Explicit URL input detected → using first column as explicit URL list; skipping discovery.', {
     rows: rows?.length ?? 0,
     uniqueCandidates: explicitInputUrls?.length ?? 0
   });
 
   // normalize + same-origin + pathPrefix + canonicalize
-  const urls = Array.from(new Set(explicitInputUrls.map(h => {
+  urls = Array.from(new Set(explicitInputUrls.map(h => {
     try {
       const u0 = new URL(h, baseOrigin);
       if (u0.origin !== baseOrigin) return null; // same-site only
@@ -327,15 +350,18 @@ if (!forceFrontier && !usingUrlsFile && sitemapMode) {
   }).filter(Boolean)));
 
   fs.writeFileSync(path.join(cfg.outDir, 'urls-from-input.txt'), urls.join('\n'), 'utf8');
-
+  log.info('explicit-urls/normalize/done', { kept: urls.length, sample: urls.slice(0,5) });
 }
 
 
   // If still no URLs, do normal discovery: sitemap → (optional) fallback crawl
 if (!usingUrlsFile && !sitemapMode) {
-  let discovered = [];
+  log.info('discover/sitemap/start', { base: cfg.base, pathPrefix: cfg.pathPrefix || '' });
+     let discovered = [];
   try {
     discovered = await discoverBySitemap(cfg.base);
+    log.info('discover/sitemap/done', { discovered: discovered.length, sample: (discovered || []).slice(0,5) });
+    
     try { telemetry.event({ type: 'sitemap/discovered', count: discovered.length }); } catch {}
   } catch (e) {
     log.warn('sitemap discovery failed', { err: String(e?.message || e) });
@@ -349,7 +375,10 @@ if (!usingUrlsFile && !sitemapMode) {
   );
 
   if (!discovered.length) {
-    log.info('No usable pages from sitemap. Crawling site (fallback)…');
+    log.info('discover/crawl/start', {
+      msg: 'No usable pages from sitemap; crawling (fallback)…',
+      partIndex: cfg.partIndex, partTotal: cfg.partTotal, bucketParts: cfg.bucketParts
+    });
 
     const browser2 = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
     const context2 = await browser2.newContext({ ignoreHTTPSErrors: true, locale: 'en-US' });
@@ -381,7 +410,9 @@ if (!usingUrlsFile && !sitemapMode) {
         workerTotal: cfg.workerTotal,
       });
 
-      // ✅ emit *after* crawlSite returns, with the actual count
+      // emit *after* crawlSite returns, with the actual count
+      log.info('discover/crawl/done', { discovered: discovered.length, sample: (discovered || []).slice(0,5) });
+      
       try { telemetry.event({ type: 'crawl/discovered', count: discovered.length }); } catch {}
     } catch (e) {
       log.warn('crawl fallback failed', { err: String(e?.message || e) });
@@ -402,8 +433,98 @@ if (!usingUrlsFile && !sitemapMode) {
         return norm.replace(/\/+$/, '');
       } catch { return null; }
     }).filter(Boolean)));
-    try { telemetry.event({ type: 'urls/normalized', count: urls.length });} catch{}
+
+    // Final scope-to-prefix for output/reporting only
+    if (cfg.pathPrefix) {
+      urls = urls.filter(u => {
+        try { return new URL(u).pathname.startsWith(cfg.pathPrefix); } catch { return false; }
+      });
+
+    } 
+    log.info('discover/normalize+scope', { postScope: urls.length, pathPrefix: cfg.pathPrefix || '', sample: urls.slice(0,5) });
+    try { fs.writeFileSync(path.join(cfg.outDir, 'urls-after-scope.txt'), urls.join('\n'), 'utf8'); } catch {}
+     
+    try { telemetry.event({ type: 'urls/normalized', count: urls.length }); } catch {}
+  } 
+
+  // ── /ANCHOR: frontier_mode_top ─────────────────────────────────────────────
+
+  // Detect "existence only" from META_ONLY_REPORTS and short-circuit fetch.
+  const onlyReports = String(process.env.META_ONLY_REPORTS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const existenceOnly = sitemapMode &&
+    onlyReports.length === 1 &&
+    (onlyReports[0] === 'existence_csv' || onlyReports[0] === 'existence');
+
+  if (existenceOnly) {
+    // Minimal: HTTP probe only; no rendering, no link extraction.
+    const { writeFileSync } = require('fs');
+    const existenceProbe = new Map();
+    const req = await chromium.request.newContext({ ignoreHTTPSErrors: true });
+    try {
+      for (const inputUrl of urls) {
+        if (stopRequested(cfg.outDir)) break;
+        let ok = false, status = 0, finalUrl = '';
+        try {
+          const res = await req.get(inputUrl, { timeout: 12000, maxRedirects: 5 });
+          ok = res.ok();
+          status = res.status();
+          finalUrl = res.url();
+       } catch {}
+        existenceProbe.set(inputUrl, { exists: !!ok, status, final_url: finalUrl || '' });
+      }
+    } finally {
+      try { await req.dispose(); } catch {}
+    }
+
+    // Emit the same existence artifacts the crawler path writes.
+    // (csv/json + working/not-working lists)
+    const normalizedInputs = Array.from(new Set(urls));
+    const rows = normalizedInputs.map(u => {
+      const hit = existenceProbe.get(u);
+      return {
+        input_url: u,
+        exists: hit && hit.exists ? 'true' : 'false',
+        http_status: hit ? hit.status : 0,
+        final_url: hit ? hit.final_url : ''
+      };
+    });
+    const okCount = rows.filter(r => r.exists === 'true').length;
+    const badCount = rows.length - okCount;
+    try { telemetry.event({ type: 'existence/summary', ok: okCount, bad: badCount }); } catch {}
+
+    const tag = (cfg.workerId ?? cfg.shardIndex ?? 1);
+    const outCsv  = path.join(cfg.outDir, `url-existence.part${tag}.csv`);
+    const outJson = path.join(cfg.outDir, `url-existence.part${tag}.json`);
+    const toCsv = (headers, rs) => {
+      const esc = s => /[",\r\n]/.test(s) ? `"${String(s).replace(/"/g,'""')}"` : String(s);
+     const head = headers.join(',');
+      const body = rs.map(r => headers.map(h => esc(r[h] ?? '')).join(',')).join('\n');
+      return head + (body ? '\n' + body : '') + '\n';
+    };
+    writeFileSync(outCsv, toCsv(['input_url','exists','http_status','final_url'], rows), 'utf8');
+    writeFileSync(outJson, JSON.stringify(rows, null, 2), 'utf8');
+
+    // working/not-working master + per-shard lists
+    const workingLines   = rows.filter(r => r.exists === 'true')
+                              .map(r => `${r.final_url || r.input_url},${r.http_status}`);
+    const notWorkingLines= rows.filter(r => r.exists !== 'true')
+                               .map(r => `${r.input_url},${r.http_status}`);
+    if (workingLines.length)
+      writeFileSync(path.join(cfg.outDir, 'working-urls.txt'), workingLines.join('\n') + '\n', 'utf8');
+    if (notWorkingLines.length)
+      writeFileSync(path.join(cfg.outDir, 'not-working-urls.txt'), notWorkingLines.join('\n') + '\n', 'utf8');
+    writeFileSync(path.join(cfg.outDir, `working-urls.part${tag}.txt`),
+      rows.filter(r => r.exists === 'true' && (r.final_url || r.input_url))
+          .map(r => r.final_url || r.input_url).join('\n') + '\n', 'utf8');
+    writeFileSync(path.join(cfg.outDir, `not-working-urls.part${tag}.txt`),
+      rows.filter(r => r.exists !== 'true').map(r => r.input_url).join('\n') + '\n', 'utf8');
+
+   // done — skip the heavy fetch/crawl entirely
+    try { telemetry.threadStatus({ workerId: cfg.workerId, phase: 'done', url: '' }); } catch {}
+    return;
   }
+  // ── /ANCHOR: existence_only_gate_top ─────────────────────────────────────────
 
   // Shard slice (if needed)
   if (cfg.shards > 1) {
@@ -438,6 +559,12 @@ if (!usingUrlsFile && !sitemapMode) {
   // Empty slice → write empty cache and finish
   if (!urls.length) {
     saveCache(cfg.cachePath, {});
+    log.warn('empty-url-slice', {
+      usingUrlsFile,
+      sitemapMode,
+      inputExists,
+     explicitInputUrls: (explicitInputUrls || []).length
+    });
     log.warn('Empty URL slice → wrote empty cache part and exited OK.');
     return;
   }
@@ -490,6 +617,10 @@ if (!usingUrlsFile && !sitemapMode) {
     try {
       telemetry.event({ type: 'fetch/plan', toFetch: toFetch.length, fromCache: fromCache.length });
     } catch {}
+    log.info('fetch/plan/details', {
+      toFetchSample: toFetch.slice(0, 5),
+      fromCacheSample: fromCache.slice(0, 5).map(p => p.url)
+    });
   }
 
   // For existence report when in sitemapMode
@@ -511,6 +642,21 @@ if (!usingUrlsFile && !sitemapMode) {
 
       let finalClaim;
       const page = await context.newPage();
+      // === LOG: Playwright signal for hard failures ===
+      page.on('requestfailed', req => {
+        try { log.warn('requestfailed', { url: req.url(), failure: req.failure()?.errorText }); } catch {}
+      });
+      page.on('response', res => {
+        try {
+          const s = res.status();
+          if (s >= 400) log.warn('http', { url: res.url(), status: s });
+        } catch {}
+      });
+      page.on('console', msg => {
+       try {
+          if (msg.type() === 'error') log.warn('console.error', { text: msg.text() });
+        } catch {}
+      });
       try {
         let final = seedUrl;
         let status = 0;
@@ -600,7 +746,11 @@ if (!usingUrlsFile && !sitemapMode) {
           telemetry.bump('internalEdges', Array.isArray(links) ? links.length : 0);
         } catch {}
 
-        const rec = { url: finalKey, title: meta.title, description: meta.description, titleN, links };
+        const linksArr = Array.isArray(links) ? links : [];
+        const normLinks = linksArr.map(l => (typeof l === 'string'
+          ? { url: l, text: '', kind: 'extracted' }
+          : l));
+        const rec = { url: finalKey, title: meta.title, description: meta.description, titleN, links: normLinks };
         out.push(rec);
         cache[finalKey] = { ...rec, lastFetched: nowIso() };
 
@@ -645,7 +795,6 @@ if (!usingUrlsFile && !sitemapMode) {
 
   // emit the hierarchical tree files now that `out` is complete
   await writeTreeReport(cfg.outDir, out.map(p => p.url), cfg.pathPrefix || '');
-  const onlyReports = String(process.env.META_ONLY_REPORTS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 
   // ---------- REPORTS ----------
@@ -685,16 +834,18 @@ if (!usingUrlsFile && !sitemapMode) {
   // Also emit a lightweight internal-links file from the extracted links
   try {
     const ilPath = path.join(cfg.outDir, `internal-links.part${tag}.ndjson`);
-    for (const p of out) {
-      const links = Array.isArray(p.links) ? p.links : [];
-      for (const linkUrl of links) {
-        fs.appendFileSync(ilPath, JSON.stringify({
-          page_url: p.url,
-          link_url: linkUrl,
-          kind: 'extracted'
-        }) + '\n', 'utf8');
+      for (const p of out) {
+        const links = Array.isArray(p.links) ? p.links : [];
+        for (const l of links) {
+          fs.appendFileSync(ilPath, JSON.stringify({
+            page_url: p.url,
+            link_url: l.url || String(l),
+            link_text: l.text || '',
+            kind: l.kind || 'extracted'
+          }) + '\n', 'utf8');
+        }
       }
-    }
+
     log.info('report', { file: path.basename(ilPath), edges: out.reduce((n, p) => n + (p.links?.length || 0), 0) });
   } catch (e) {
     log.warn('internal-links emit failed', { err: String(e && e.message ? e.message : e) });

@@ -9,6 +9,8 @@ const http = require('http');
 const os   = require('os');
 const { exec } = require('child_process');
 
+
+
 // --- optional telemetry (safe no-op if module not present) ---
 let telemetry = null;
 try {
@@ -71,6 +73,16 @@ function renameWithRetry(from, to, tries = 40) {
   throw last || new Error(`Failed to rename after ${tries} attempts: ${from} -> ${to}`);
 }
 
+// Small sleep primitive (used for lock retry)
+function sleepMs(ms){
+  try {
+    const sab = new SharedArrayBuffer(4);
+    Atomics.wait(new Int32Array(sab), 0, 0, Math.max(0, ms|0));
+  } catch {
+    const start = Date.now(); while (Date.now() - start < ms) {}
+  }
+}
+
 // ---------- Legacy (single-file) helpers kept for backward compat ----------
 function seedFrontier(file, urls) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -92,14 +104,54 @@ function tryClaim(locksDir, url) {
   const lockPath = path.join(locksDir, `${id}.lock`);
   const donePath = path.join(locksDir, `${id}.done`);
   if (fs.existsSync(donePath)) return null; // already processed
+  // Robust exclusive create with retries (Windows/OneDrive/AV can return EBUSY/EPERM transiently)
+  let fd = -1;
+  const MAX_TRIES = parseInt(process.env.MC_LOCK_TRIES || '60', 10); // ~6s worst-case
+  const SLEEP_MS  = parseInt(process.env.MC_LOCK_SLEEP || '100', 10);
+  for (let i = 0; i < MAX_TRIES; i++) {
+    try {
+      fd = fs.openSync(lockPath, 'wx'); // exclusive create
+      break; // success
+    } catch (e) {
+      // If another worker already claimed (lock file exists), treat as "someone else owns it"
+     if (e && (e.code === 'EEXIST')) return null;
+      // Transient Windows/OneDrive/AV conditions — retry
+      if (e && (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES' || e.code === 'EPROTO')) {
+        sleepMs(SLEEP_MS);
+        continue;
+      }
+      // Unknown hard error — give up on this URL (behave like already claimed)
+      return null;
+    }
+  }
+  if (fd < 0) {
+   // Still couldn't create after retries — skip this URL
+    return null;
+  }
   try {
-    const fd = fs.openSync(lockPath, 'wx'); // exclusive create
-    fs.writeFileSync(fd, JSON.stringify({ url, at: new Date().toISOString(), pid: process.pid }) + '\n');
-    const complete = () => { try { fs.closeSync(fd); renameWithRetry(lockPath, donePath); } catch {} };
+    fs.writeFileSync(
+      fd,
+      JSON.stringify({ url, at: new Date().toISOString(), pid: process.pid }) + '\n'
+    );
+    const complete = () => {
+      try { fs.closeSync(fd); renameWithRetry(lockPath, donePath); } catch {}
+   };
+    // Opportunistic GC of old .done files (best-effort)
+      try {
+        const dir = path.dirname(lockPath);
+        const files = fs.readdirSync(dir).filter(f => f.endsWith('.done'));
+        const maxDone = parseInt(process.env.MC_MAX_DONE || '5000', 10);
+        if (files.length > maxDone) {
+          const victims = files.slice(0, files.length - maxDone);
+          for (const v of victims) try { fs.unlinkSync(path.join(dir, v)); } catch {}
+        }
+      } catch {}
+
     const release  = () => { try { fs.closeSync(fd); fs.unlinkSync(lockPath); } catch {} };
     return { lockPath, donePath, complete, release };
-  } catch {
-    return null; // someone else owns it (or in progress)
+   } catch {
+    try { if (fd >= 0) { fs.closeSync(fd); fs.unlinkSync(lockPath); } } catch {}
+    return null; // treat as unclaimable this pass
   }
 }
 
@@ -167,10 +219,12 @@ function acquireBucketOwner(frontierDir, r, ownerTag = '') {
 
 function seedBuckets(frontierDir, urls, parts){
   if (!urls?.length) return;
+  parts = Math.max(1, (parseInt(parts, 10) || 0));
   fs.mkdirSync(frontierDir, { recursive: true });
   // ensure files exist
   for (let r=0; r<parts; r++){
-    const { file } = bucketFiles(frontierDir, r);
+    const { file } = bucketFiles(frontierDir, r); 
+
     if (!fs.existsSync(file)) writeFileWithRetry(file, '', 'utf8');
   }
   appendToBuckets(frontierDir, urls, parts);
@@ -178,6 +232,7 @@ function seedBuckets(frontierDir, urls, parts){
 
 function appendToBuckets(frontierDir, urls, parts){
   if (!urls?.length) return;
+  parts = Math.max(1, (parseInt(parts, 10) || 0));
   const perBucket = new Map();
   for (const raw of urls){
     if (!raw) continue;
@@ -187,6 +242,15 @@ function appendToBuckets(frontierDir, urls, parts){
   }
   for (const [r, list] of perBucket){
     const { file } = bucketFiles(frontierDir, r);
+    try {
+      const st = fs.existsSync(file) ? fs.statSync(file) : null;
+      const max = parseInt(process.env.MC_BUCKET_MAX_BYTES || '134217728', 10); // 128MB
+    if (st && st.size > max) {
+        const rotated = file.replace(/\.ndjson$/, `.${Date.now()}.ndjson`);
+        renameWithRetry(file, rotated);
+        writeFileWithRetry(file, '', 'utf8');
+      }
+    } catch {}
     appendFileWithRetry(file, list.map(u => u + '\n').join(''));
     tEmit('bucketAppend', { bucket: r, count: list.length });
   }
@@ -204,21 +268,32 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
   let pos = 0;
   try { pos = parseInt(readFileWithRetry(offset, 'utf8').trim() || '0', 10) || 0; } catch {}
 
-  const buf = readFileWithRetry(file); // tolerate OneDrive/AV locks
+  // Read raw and normalize (strip BOM, normalize CRLF)
+  let buf = readFileWithRetry(file);
+  // Defensive: BOM at the very beginning can poison first split
+  if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
+    buf = Buffer.from(buf.slice(3));
+  }
+    // Defensive: if offset is beyond EOF (truncate/rotate), clamp it
+    if (pos > buf.length) {
+      try { writeFileWithRetry(offset, String(buf.length), 'utf8'); } catch {}
+      pos = buf.length;
+    }
   if (pos >= buf.length) {
     tEmit('bucketProgress', { bucket: r, cursor: pos, size: buf.length });
     return null; // nothing new
   }
 
-  const tail = buf.toString('utf8', pos);
-  const lines = tail.split(/\r?\n/);
-  let advanced = 0;
+  // Normalize CRLF → LF before slicing to lines
+  const tail = buf.toString('utf8', pos).replace(/\r\n/g, '\n');
+  const lines = tail.split('\n');
+  let claimed = false;
 
   for (let i=0; i<lines.length; i++){
     const line = lines[i];
     const withNl = i < lines.length - 1 ? line + '\n' : line; // last item may not end with NL
     const inc = Buffer.byteLength(withNl, 'utf8');
-    const url = line.trim();
+    const url = (line || '').trim();
     advanced += inc;
 
     if (!url) continue;
@@ -230,6 +305,7 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
       const newPos = pos + advanced;
       try { writeFileWithRetry(offset, String(newPos), 'utf8'); } catch {}
       tEmit('bucketProgress', { bucket: r, cursor: newPos, size: buf.length, claimed: true });
+      claimed = true;
       const delayMs = parseInt(process.env.MC_POLITE_DELAY_MS || '0', 10) || 0;
       if (delayMs > 0) { try { sleepMs(delayMs); } catch {} }
       return { url, ...claim };
@@ -237,8 +313,8 @@ function claimNextBucket(frontierDir, locksDir, r, parts, acceptFn){
   }
 
   // consumed all new lines, advance cursor to EOF
-  try { writeFileWithRetry(offset, String(buf.length), 'utf8'); } catch {}
-  tEmit('bucketProgress', { bucket: r, cursor: buf.length, size: buf.length });
+  try { writeFileWithRetry(offset, String(pos), 'utf8'); } catch {}
+  tEmit('bucketProgress', { bucket: r, cursor: pos, size: buf.length, claimed: false });
   return null;
 }
 
